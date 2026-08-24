@@ -117,7 +117,7 @@ class FindingFix:
         }
 
 
-def _build_fix_library() -> dict:
+def _build_fix_library() -> dict[str, FindingFix]:
     """Return the curated fix catalogue as ``{finding_key|scope: FindingFix}``.
 
     AISO-215 acceptance criterion: every entry is a single
@@ -133,7 +133,7 @@ def _build_fix_library() -> dict:
     iterating ``FIX_LIBRARY.values()`` walks fixes in canonical
     (scope → risk) reading order without an extra sort.
     """
-    lib: dict = {}
+    lib: dict[str, FindingFix] = {}
 
     # ----------------------------------------------------------------
     # D2 — known probe paths (/.env, /wp-login.php, ...).
@@ -436,10 +436,23 @@ def _build_fix_library() -> dict:
     # ----------------------------------------------------------------
     # D9 — sudo authentication failure burst per user.
     # 2 fixes: both local_config (sudoers tightening, NOPASSWD audit).
+    #
+    # AISO-215 follow-up: the two D9 fixes must each get their own
+    # library row, not collide on the same ``local_config`` key. The
+    # compound key is ``f"{finding_key}|{scope}"`` so two ``local_config``
+    # rows collide and the second ``_add`` silently overwrites the first
+    # — the per-user sudoers-review fix was lost. Use sub-scoped keys
+    # (``local_config:sudoers_review`` / ``local_config:nopasswd_audit``)
+    # following the D5 ``waf:cflare`` / ``waf:modsec`` precedent. The
+    # renderer groups each sub-scope under its own ``### local_config:
+    # <name>`` section (mirroring D5's two WAF subsections); the
+    # ``_sort_key``/``_scope_index`` fall back to the bare ``local_config``
+    # bucket so the canonical scope ordering stays ``local_config``
+    # first — operator-eye reading order is unchanged.
     # ----------------------------------------------------------------
     _add(
         lib,
-        "D9:sudo_failures", SCOPE_LOCAL_CONFIG,
+        "D9:sudo_failures", "local_config:sudoers_review",
         what="Review the user's sudoers entry — restrict NOPASSWD / drop unused commands",
         why=(
             "Repeated sudo-fail for a single user is either a typo on "
@@ -463,7 +476,7 @@ def _build_fix_library() -> dict:
     )
     _add(
         lib,
-        "D9:sudo_failures", SCOPE_LOCAL_CONFIG,
+        "D9:sudo_failures", "local_config:nopasswd_audit",
         what="Audit accounts with NOPASSWD: ALL — replace with explicit command lists",
         why=(
             "NOPASSWD: ALL on any account is an audit finding on its "
@@ -538,7 +551,7 @@ def _split_library_key(key: str) -> tuple:
 # The public catalogue. AISO-215 AC#1: this MUST be
 # ``dict[str, FindingFix]``, not a list-of-fixes under a finding-key
 # bucket. Built once at import time via ``_build_fix_library``.
-FIX_LIBRARY: dict = _build_fix_library()
+FIX_LIBRARY: dict[str, FindingFix] = _build_fix_library()
 
 
 def lookup_fix(finding_key: str, scope: str) -> FindingFix:
@@ -661,12 +674,30 @@ def attach_fixes(
 
 
 def sort_fixes(fixes: Iterable) -> list:
-    """Sort by (scope-order, risk-order, what) — stable for deterministic output."""
+    """Sort by (scope-order, risk-order, what) — stable for deterministic output.
+
+    AISO-215 follow-up: sub-scoped library keys (e.g. ``waf:cflare``,
+    ``local_config:sudoers_review``) collapse to their primary scope
+    (``waf`` / ``local_config``) for the sort index so they land
+    adjacent to their bare-scope peers. The full sub-scope string is
+    still used as a tiebreaker so the renderer's per-bucket ordering
+    stays deterministic. Pre-fix ``sort_fixes`` looked up
+    ``fix.scope`` verbatim and put sub-scoped fixes at the bottom of
+    the layout — the operator-eye reading order then jumped from
+    ``waf:cflare`` (canonical-waf position) to "unknown scope" at the
+    end, which broke the cheap-first reading flow.
+    """
     scope_index = {s: i for i, s in enumerate(SCOPE_ORDER)}
 
     def _key(fix):
+        # Primary bucket: drop the ``:sub`` tail so sub-scoped fixes
+        # sort beside their parent scope. Unknown sub-scope parents
+        # (``foo:bar`` for a non-canonical parent) fall through to the
+        # unknown-scope bucket at the end.
+        primary = fix.scope.split(":", 1)[0]
         return (
-            scope_index.get(fix.scope, len(SCOPE_ORDER)),
+            scope_index.get(primary, len(scope_index)),
+            fix.scope,
             RISK_ORDER.get(fix.risk, 99),
             fix.what,
         )
