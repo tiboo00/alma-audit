@@ -195,6 +195,15 @@ def rule_probe_paths(
             or {},
             # AISO-197: top attacker rollup across all probe paths.
             "top_attackers": _serialise_top_attackers(agg),
+            # AISO-208: top path × IP × user-agent combinations.
+            # Same IP hitting /.env with python-requests vs /wp-login.php
+            # with curl are different threat vectors — a per-IP rollup
+            # loses that distinction. The full per-(path, ip) UA map
+            # stays in `probe_paths_by_ip` for forensic consumers; this
+            # field is the operator-eye flat list, ranked by count desc,
+            # capped at the same `_TOP_PATH_IP_UA_LIMIT` budget so the
+            # MD summary stays bounded.
+            "top_path_ip_ua": _serialise_top_path_ip_ua(agg),
             # D2/D5: these are NEVER suppressed by crawler verification,
             # so the field is the `n/a` sentinel.
             "crawler_suppression": CrawlerSuppression.not_applicable().to_dict(),
@@ -205,6 +214,74 @@ def rule_probe_paths(
             "`probe_paths_by_ip`."
         ),
     )]
+
+
+# AISO-208: cap on the path × IP × UA combination list. The forensic
+# JSON keeps the full per-(path, ip) breakdown; this cap is just the
+# top-N slice surfaced inline in the Markdown summary. 50 entries
+# comfortably covers any realistic single-IP scanner pattern while
+# keeping the MD report scannable.
+_TOP_PATH_IP_UA_LIMIT = 50
+
+
+def _serialise_top_path_ip_ua(agg: AccessAggregator) -> list[dict[str, Any]]:
+    """Flatten every (path, ip) bucket into per-UA rows, ranked by count.
+
+    The aggregator tracks user-agents per (path, ip) pair — each bucket
+    may hold up to 5 distinct UAs. We expand those into one row per
+    (path, ip, ua) triple, sorted by count desc, so the operator sees
+    the highest-volume UA-on-which-path combination first. The per-(path,
+    ip) total count is split evenly across the bucket's UAs only when
+    the bucket actually held multiple UAs; for the common single-UA
+    case the row carries the full bucket count, which is what the
+    operator expects ("× 27 requests using python-requests/2.28.0").
+
+    The full per-(path, ip, UA) breakdown is preserved in
+    `probe_paths_by_ip` for the forensic JSON consumers; this list is
+    the trimmed operator-eye view rendered in the MD summary.
+    """
+    rows: list[dict[str, Any]] = []
+    for path, ip_map in agg.probe_by_path_ip.items():
+        for ip, stat in ip_map.items():
+            bucket_count = stat.count
+            uas = list(stat.user_agents)
+            if not uas:
+                # No UA tracked — emit a single "<unknown>" row so the
+                # bucket still appears in the operator's view.
+                rows.append({
+                    "path": path,
+                    "ip": ip,
+                    "user_agent": "<unknown>",
+                    "count": bucket_count,
+                })
+                continue
+            if len(uas) == 1:
+                rows.append({
+                    "path": path,
+                    "ip": ip,
+                    "user_agent": uas[0],
+                    "count": bucket_count,
+                })
+                continue
+            # Multiple UAs in one bucket — distribute the bucket count
+            # across the UAs that were seen. This is an approximation
+            # (we don't track per-UA counts inside the bucket today)
+            # but it preserves the invariant "sum of UA counts in a
+            # bucket = bucket total count", which the operator can
+            # rely on. The forensic JSON carries the exact per-(path,
+            # ip) totals, so the operator can always drill in.
+            per_ua, remainder = divmod(bucket_count, len(uas))
+            for idx, ua in enumerate(uas):
+                rows.append({
+                    "path": path,
+                    "ip": ip,
+                    "user_agent": ua,
+                    # Last UA absorbs the remainder so the rows sum
+                    # back to `bucket_count`.
+                    "count": per_ua + (remainder if idx == len(uas) - 1 else 0),
+                })
+    rows.sort(key=lambda r: r["count"], reverse=True)
+    return rows[:_TOP_PATH_IP_UA_LIMIT]
 
 
 def _serialise_probe_paths_by_ip(
