@@ -74,3 +74,139 @@ def test_run_analyzers_silent_when_cryptography_missing_and_no_cert_roots():
     # And no CRITICAL / non-INFO findings overall.
     from alma_audit.models import Severity
     assert all(f.severity == Severity.INFO for f in findings)
+
+
+# --------------------------------------------------------------------
+# AISO-209 review fix: ``modules.ssh_hardening.config_path`` YAML key
+# --------------------------------------------------------------------
+
+
+def _ssh_hardening_findings(findings):
+    """Return only the ssh_hardening-scan INFO finding (the one whose
+    title starts with ``Scanned ...``)."""
+    return [
+        f for f in findings
+        if f.module == "ssh_hardening"
+        and f.title.startswith("Scanned ")
+    ]
+
+
+def test_modules_ssh_hardening_config_path_overrides_default():
+    """The issue-spec key ``modules.ssh_hardening.config_path``
+    must take effect when set. We register the SSH file ONLY at the
+    alternate path; if the runner reads the default ``paths.*`` key
+    instead, the analyzer sees an empty filesystem and emits the
+    "No sshd_config files found" INFO rather than the
+    "Scanned ... " finding with the file content."""
+    from alma_audit.analyzers.ssh_hardening import (
+        DEFAULT_SSHD_CONFIG_PATH,
+        DEFAULT_SSHD_DROP_IN_DIR,
+    )
+
+    alt = "/opt/ssh/etc/sshd_config"
+    fs = FakeFileSystem(files={
+        alt: "Protocol 2\nPermitRootLogin yes\n",
+    })
+    cfg = Config()
+    cfg.modules["ssh_hardening"] = {"config_path": alt}
+    findings = run_analyzers(cfg, fs)
+
+    scanned = _ssh_hardening_findings(findings)
+    assert scanned, (
+        "modules.ssh_hardening.config_path did NOT take effect — "
+        "the analyzer didn't pick up the alternate sshd_config"
+    )
+    detail = scanned[0].details
+    assert detail["config_path"] == alt
+    assert alt in detail["files_scanned"]
+    assert DEFAULT_SSHD_CONFIG_PATH not in detail["files_scanned"]
+
+
+def test_paths_ssh_config_path_still_works_for_backcompat():
+    """``paths.ssh_config_path`` (the original PR #12 key) remains a
+    valid override for operators who haven't migrated to the module-
+    level key."""
+    alt = "/etc/ssh/sshd_config.test"
+    fs = FakeFileSystem(files={
+        alt: "Protocol 2\nPermitRootLogin yes\n",
+    })
+    cfg = Config()
+    cfg.paths.ssh_config_path = alt
+    cfg.paths.ssh_drop_in_dir = "/nonexistent"
+    findings = run_analyzers(cfg, fs)
+
+    scanned = _ssh_hardening_findings(findings)
+    assert scanned
+    assert scanned[0].details["config_path"] == alt
+
+
+def test_modules_key_wins_over_paths_key():
+    """When BOTH ``paths.ssh_config_path`` and
+    ``modules.ssh_hardening.config_path`` are set, the module key
+    wins (the issue-spec path is the more specific contract)."""
+    paths_key = "/etc/ssh/paths-key.conf"
+    modules_key = "/etc/ssh/modules-key.conf"
+    fs = FakeFileSystem(files={
+        paths_key: "Protocol 2\nPermitRootLogin yes\n",
+        modules_key: "Protocol 2\nPermitRootLogin no\n",
+    })
+    cfg = Config()
+    cfg.paths.ssh_config_path = paths_key
+    cfg.paths.ssh_drop_in_dir = "/nonexistent"
+    cfg.modules["ssh_hardening"] = {"config_path": modules_key}
+    findings = run_analyzers(cfg, fs)
+
+    scanned = _ssh_hardening_findings(findings)
+    assert scanned
+    assert scanned[0].details["config_path"] == modules_key
+    # The PermitRootLogin no from the modules-key file MUST be in
+    # effect (no CRITICAL).
+    crit = [
+        f for f in findings
+        if f.module == "ssh_hardening" and "root SSH login" in f.title
+    ]
+    assert crit == []
+
+
+def test_modules_ssh_hardening_drop_in_dir_is_honoured():
+    """``modules.ssh_hardening.drop_in_dir`` (an optional sibling
+    of ``config_path``) is honoured too — sets the drop-in
+    directory independently of ``config_path``'s parent dir."""
+    from alma_audit.analyzers.ssh_hardening import DEFAULT_SSHD_CONFIG_PATH
+
+    fs = FakeFileSystem(files={
+        DEFAULT_SSHD_CONFIG_PATH: (
+            "Include /opt/ssh/drop-ins/*.conf\n"
+            "Protocol 2\n"
+        ),
+        "/opt/ssh/drop-ins/10-weak.conf": "PermitRootLogin yes\n",
+    })
+    cfg = Config()
+    cfg.modules["ssh_hardening"] = {
+        "drop_in_dir": "/opt/ssh/drop-ins",
+    }
+    findings = run_analyzers(cfg, fs)
+    # Default config_path is used (no override) but the drop-in
+    # directory comes from the module key — and the main file's
+    # ``Include`` directive picks it up.
+    crit = [
+        f for f in findings
+        if f.module == "ssh_hardening" and "root SSH login" in f.title
+    ]
+    assert len(crit) == 1
+    assert crit[0].details["source_path"] == "/opt/ssh/drop-ins/10-weak.conf"
+
+
+def test_modules_ssh_hardening_config_path_invalid_type_is_ignored():
+    """A non-string ``config_path`` (typo / bool / int / None) is
+    ignored — the analyzer falls back to ``paths.ssh_config_path``.
+    This protects operators from a config typo killing the audit."""
+    fs = FakeFileSystem(files={
+        "/etc/ssh/sshd_config": "Protocol 2\n",
+    })
+    cfg = Config()
+    cfg.modules["ssh_hardening"] = {"config_path": 12345}  # bogus
+    findings = run_analyzers(cfg, fs)
+    scanned = _ssh_hardening_findings(findings)
+    assert scanned
+    assert scanned[0].details["config_path"] == "/etc/ssh/sshd_config"

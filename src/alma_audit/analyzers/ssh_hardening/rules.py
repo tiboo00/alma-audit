@@ -15,10 +15,12 @@ follows acceptance criterion #3 from AISO-209:
     (key-only root, acceptable but worth noting),
     ``Protocol 2,1`` (same as 1,2), no ``Banner``.
 
-Each rule reads the last-wins snapshot from the aggregator and
-emits one ``Finding`` per detected posture. The ``details`` dict
-carries the actual line that triggered the rule (per acceptance
-criterion #4).
+Each rule reads the first-obtained-wins snapshot from the
+aggregator (matching ``sshd_config(5)`` semantics — the first
+obtained value of every keyword is used, not the last) and emits
+one ``Finding`` per detected posture. The ``details`` dict carries
+the actual line that triggered the rule (per acceptance criterion
+#4).
 """
 
 from __future__ import annotations
