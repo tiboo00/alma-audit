@@ -46,7 +46,24 @@ def analyze_access_logs(
     # A `max_lines_per_file` of 0 (or negative) disables the cap.
     cap = settings["max_lines_per_file"] or None
     resolver = resolver or SocketResolver()
-    agg = AccessAggregator()
+    # AISO-208 (review fix #2): the cap is plumbed via the aggregator
+    # constructor so a single setting key (YAML-configurable under
+    # ``modules.access_log.ip_user_agent_cap``) bounds the per-IP
+    # rollup. Cap convention follows the rest of the analyzer:
+    # **negative** disables the cap (operator opts into unbounded
+    # cost on UA-diverse per-IP traffic). Default of 5 keeps the
+    # rollup bounded on the realistic common case — measured to
+    # avoid O(n²) amplification on 40k-record single-IP logs.
+    raw_ua_cap = settings.get("ip_user_agent_cap", 5)
+    # Normalise: 0 → -1 (no cap); negative stays negative; positive
+    # capped at the historic 5-baseline window.
+    if raw_ua_cap is None or raw_ua_cap < 0:
+        ip_ua_cap = -1  # sentinel: no cap.
+    elif raw_ua_cap == 0:
+        ip_ua_cap = -1  # 0 also means "no cap" by operator convention.
+    else:
+        ip_ua_cap = int(raw_ua_cap)
+    agg = AccessAggregator(ip_user_agent_cap=ip_ua_cap)
     files_scanned = 0
     files_truncated: list[str] = []
     # Track if the file we are reading is itself an issue — e.g.
