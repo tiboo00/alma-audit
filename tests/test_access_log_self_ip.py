@@ -267,6 +267,43 @@ def test_error_rate_rule_external_drives_severity():
     assert findings[0].severity == Severity.WARN
 
 
+def test_error_rate_rule_all_self_ip_emits_no_d4_finding():
+    """AISO-211 acceptance: all-self-IP sample → NO D4 finding.
+
+    The acceptance contract says: when every traffic sample is from
+    the host's own IPs (external_total == 0 AND self_total > 0), D4
+    MUST NOT emit a finding. The severity decision is driven by the
+    EXTERNAL rate only — falling back to the unfiltered total rate
+    in that case is a contract violation because cPanel / cpsrvd
+    self-admin-panel probing routinely produces 100% self-IP error
+    traffic on real hosts, and the operator does not want a CRITICAL
+    finding on its own daemon's noise.
+
+    Repro: 100× ``127.0.0.1`` status 500 + ``self_ips={"127.0.0.1"}``
+    → ``external_total_requests == 0``, ``error_rate_external is None``,
+    but the unfiltered rate is 100% which (without the fix) trips
+    ``CRITICAL Error rate 100.0% (100/100)``.
+    """
+    rows = [("127.0.0.1", 500, "/wp-login.php") for _ in range(100)]
+    findings, summary = _run_error_rate_rule(rows, self_ips={"127.0.0.1"})
+    # The diagnostic details still surface the partition so the
+    # operator can see the all-self distribution; only the finding
+    # itself is suppressed.
+    assert findings == [], (
+        "D4 MUST NOT emit a finding when 100% of error traffic is "
+        "self-IP — the severity decision is driven by external rate "
+        "only, and the external rate is undefined (None) when no "
+        "external traffic was sampled."
+    )
+    # Sanity: the underlying aggregator partition still records
+    # the self-IP events for the forensic JSON, even though no
+    # finding was emitted.
+    assert summary["self_ip_event_count"] == 100
+    # The host-errors internal rollup carries the self-IP data.
+    internal_ips = {row["ip"] for row in summary["host_errors_internal_top"]}
+    assert internal_ips == {"127.0.0.1"}
+
+
 def test_error_rate_rule_no_self_ip_external_is_none():
     """AISO-211: sample with no self-IP traffic → error_rate_external None.
 
