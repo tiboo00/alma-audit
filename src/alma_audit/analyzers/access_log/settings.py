@@ -19,6 +19,12 @@ DEFAULT_RULES: dict[str, Any] = {
     "probe_count_warn": 10,             # ≥10 probe hits → WARN
     "probe_count_crit": 100,            # ≥100 → CRITICAL
     "weird_method_count_warn": 5,
+    # AISO-204: bandwidth anomaly detection (top bandwidth hog).
+    # On a tiny log a single host is mechanically dominant — so the rule
+    # applies only when the access_log holds at least this many lines.
+    "bandwidth_hog_min_lines": 1000,
+    "bandwidth_hog_warn": 0.50,         # ≥50% of total bytes → WARN
+    "bandwidth_hog_crit": 0.80,         # ≥80% → CRITICAL
     "max_files_scanned": 50,
     "max_lines_per_file": 200_000,
 }

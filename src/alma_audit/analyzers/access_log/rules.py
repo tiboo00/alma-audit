@@ -1,11 +1,12 @@
 """Detection rules for the access_log analyzer.
 
-Four rules, each emitting zero or more `Finding` records:
+Five rules, each emitting zero or more `Finding` records:
 
   D1 — top-host concentration (crawler-suppressible)
   D4 — 4xx + 5xx burst rate (crawler-suppressible on the burst host)
   D2 — known probe paths (NEVER crawler-suppressible)
   D5 — unusual HTTP methods (NEVER crawler-suppressible)
+  D6 — top bandwidth hog (AISO-204; single IP -> unusual share of bytes)
 
 The crawler-suppressibility distinction is the §6.1 contract:
 D2/D5 are never suppressed because a Googlebot asking for `/.env` is
@@ -16,6 +17,12 @@ and (where applicable) a per-path / per-IP / per-host breakdown so the
 operator can identify the source of the activity, not just the
 aggregate count. The full forensic view is in the JSON `details`;
 the Markdown rendering slices it for readability.
+
+AISO-204: a single IP carrying an unusual share of the access_log's
+byte volume is a stronger exfiltration signal than a 4xx count alone
+(404-spam can disguise outbound dataflow). The rule skips samples
+smaller than `bandwidth_hog_min_lines`, where one host is mechanically
+dominant and the signal is meaningless.
 """
 
 from __future__ import annotations
@@ -266,4 +273,79 @@ def rule_weird_methods(
             "crawler_suppression": CrawlerSuppression.not_applicable().to_dict(),
         },
         recommendation="Inspect source IPs; consider blocking WebDAV methods if not used.",
+    )]
+
+
+def rule_bandwidth_hog(
+    agg: AccessAggregator,
+    settings: dict[str, Any],
+) -> list[Finding]:
+    """D6 — AISO-204 top bandwidth hog.
+
+    A single source IP responsible for an unusual share of the total
+    bytes served is a stronger exfiltration signal than a 4xx count
+    (404-spam can disguise outbound dataflow).
+
+    The rule is intentionally skipped when the sample is too small to
+    be meaningful (`bandwidth_hog_min_lines`, default 1000). At that
+    scale one host is mechanically dominant and any threshold trips.
+
+    Thresholds default to WARN at >=50% and CRITICAL at >=80% of total
+    bytes; both are overridable via `modules.access_log.bandwidth_hog_*`
+    config keys (AISO-207 will tighten the plumbing).
+    """
+    total_lines = settings.get("bandwidth_hog_min_lines", 1000)
+    if agg.total_lines < total_lines:
+        return []
+    bytes_total = agg.bytes_total
+    if bytes_total <= 0 or not agg.bytes_by_host:
+        return []
+    # `most_common` returns (host, bytes) ordered desc; we only need the
+    # top hog — multi-host findings are out of scope for AISO-204.
+    hog_host, hog_bytes = agg.bytes_by_host.most_common(1)[0]
+    share = hog_bytes / bytes_total
+    warn_threshold = settings["bandwidth_hog_warn"]
+    crit_threshold = settings["bandwidth_hog_crit"]
+    if share >= crit_threshold:
+        sev: Severity | None = Severity.CRITICAL
+    elif share >= warn_threshold:
+        sev = Severity.WARN
+    else:
+        return []
+    details: dict[str, Any] = {
+        "host": hog_host,
+        "bytes": hog_bytes,
+        "share": share,
+        "total": bytes_total,
+        "thresholds": {
+            "warn": warn_threshold,
+            "crit": crit_threshold,
+            "min_lines": total_lines,
+        },
+        # AISO-197-style forensic detail: the per-host byte ranks so the
+        # operator can see whether one IP truly dwarfs the rest or whether
+        # there is a near-tie that pushed it over the threshold.
+        "bytes_by_host_top": agg.bytes_by_host.most_common(10),
+        "crawler_suppression": CrawlerSuppression.not_applicable().to_dict(),
+    }
+    return [Finding(
+        module="access_log",
+        severity=sev,
+        title=(
+            f"{'CRITICAL' if sev is Severity.CRITICAL else 'WARN'} "
+            f"bandwidth hog: {hog_host} served {share:.0%} of bytes "
+            f"({hog_bytes:,} / {bytes_total:,})"
+        ),
+        description=(
+            f"Source IP {hog_host!r} carried {hog_bytes:,} of "
+            f"{bytes_total:,} bytes ({share:.1%}) in the scanned access log. "
+            "On a busy host an IP dominating byte volume can indicate "
+            "data exfiltration disguised as legitimate traffic; correlate "
+            "with secure_log / domlog_inventory and consider egress rules."
+        ),
+        details=details,
+        recommendation=(
+            "Investigate the host's traffic; correlate with domlog_inventory "
+            "and consider a per-IP byte rate-limit in the WAF."
+        ),
     )]

@@ -3,7 +3,7 @@
 Orchestrates the parser, aggregator, and rules. Reads files via the
 injected `FileSystem` (read-only contract enforced upstream), respects
 `max_files_scanned` and `max_lines_per_file` caps, and dispatches the
-four rules in D1/D4/D2/D5 order. Returns a flat list of `Finding`.
+five rules in D1/D4/D2/D5/D6 order. Returns a flat list of `Finding`.
 
 External callers import `analyze_access_logs` from this module; the
 legacy `from alma_audit.analyzers.access_log import ...` paths are
@@ -20,6 +20,7 @@ from ..crawler_verify import Resolver, SocketResolver
 from .aggregator import AccessAggregator
 from .parser import parse_line
 from .rules import (
+    rule_bandwidth_hog,
     rule_error_rate,
     rule_probe_paths,
     rule_top_host_concentration,
@@ -122,5 +123,6 @@ def analyze_access_logs(
     ))
     findings.extend(rule_probe_paths(agg, settings))
     findings.extend(rule_weird_methods(agg, settings))
+    findings.extend(rule_bandwidth_hog(agg, settings))
 
     return findings
