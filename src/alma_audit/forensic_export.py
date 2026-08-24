@@ -23,8 +23,49 @@ the helper emits one payload per category.
 
 from __future__ import annotations
 
+import ipaddress
 from collections import defaultdict
 from typing import Any
+
+
+# AISO-200: local / private / loopback / link-local IP ranges must NEVER
+# land in a Cloudflare block rule. The operator would lock themselves
+# out (127.0.0.1 = the audit host itself; 10/8 / 172.16/12 / 192.168/16 =
+# RFC1918 private networks behind the CDN; ::1 = IPv6 loopback; fe80::/10 =
+# IPv6 link-local; 169.254/16 = IPv4 link-local).
+_LOCAL_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("fe80::/10"),
+    # Cloudflare's own internal range (per the CF API docs) — these IPs
+    # are the CDN edge network and never originate from real clients.
+    ipaddress.ip_network("173.245.48.0/20"),
+    # Documentation / reserved blocks we never want to block.
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("240.0.0.0/4"),
+]
+
+
+def _is_local_ip(ip: str) -> bool:
+    """True if the IP belongs to a loopback / private / reserved range.
+
+    Used by `build_cloudflare_block_payloads` to drop IPs that the
+    operator must NEVER block on Cloudflare.
+    """
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        # Unparseable — treat as external so we don't accidentally
+        # swallow a real attacker IP that has a typo.
+        return False
+    return any(addr in net for net in _LOCAL_NETWORKS)
 
 
 def build_cloudflare_block_payloads(
@@ -40,6 +81,11 @@ def build_cloudflare_block_payloads(
     `min_ips` IPs are dropped — single-IP rules don't justify a
     firewall rule and can go in the operator's manual allow/deny list.
 
+    Local / private / loopback / link-local IPs are filtered out
+    automatically (AISO-200). The full un-filtered list still lands
+    in `alma-audit-forensic.json` for diagnostic purposes — only the
+    Cloudflare payloads are scrubbed.
+
     Returns a list of ready-to-POST JSON payloads.
     """
     min_ips = 3  # below this, the operator can block manually
@@ -48,6 +94,16 @@ def build_cloudflare_block_payloads(
     brute_force_ips: dict[str, dict[str, Any]] = defaultdict(dict)
     error_burst_ips: dict[str, dict[str, Any]] = defaultdict(dict)
     sudo_fail_ips: dict[str, dict[str, Any]] = defaultdict(dict)
+
+    local_ip_filtered: set[str] = set()
+
+    def _absorb(row_ip: str, target: dict[str, dict[str, Any]], field: str) -> None:
+        if _is_local_ip(row_ip):
+            local_ip_filtered.add(row_ip)
+            return
+        if row_ip:
+            target.setdefault(row_ip, {"count": 0})
+            target[row_ip]["count"] += row.get(field, 0)
 
     for f in findings:
         details = getattr(f, "details", None) or {}
@@ -59,8 +115,10 @@ def build_cloudflare_block_payloads(
                 ip = row.get("ip", "")
                 if not ip:
                     continue
-                # Per-IP count > 0 means the IP actively probed us.
                 if row.get("total_probe_requests", 0) > 0:
+                    if _is_local_ip(ip):
+                        local_ip_filtered.add(ip)
+                        continue
                     scanner_ips.setdefault(ip, {"probe_count": 0, "ua": []})
                     scanner_ips[ip]["probe_count"] += row["total_probe_requests"]
                     ua = row.get("user_agents", [])
@@ -75,6 +133,9 @@ def build_cloudflare_block_payloads(
                 if not ip:
                     continue
                 if row.get("error_count", 0) > 0:
+                    if _is_local_ip(ip):
+                        local_ip_filtered.add(ip)
+                        continue
                     error_burst_ips.setdefault(ip, {"error_count": 0})
                     error_burst_ips[ip]["error_count"] += row["error_count"]
 
@@ -86,6 +147,9 @@ def build_cloudflare_block_payloads(
                 if not ip:
                     continue
                 if row.get("count", 0) > 0:
+                    if _is_local_ip(ip):
+                        local_ip_filtered.add(ip)
+                        continue
                     brute_force_ips.setdefault(ip, {"count": 0})
                     brute_force_ips[ip]["count"] += row["count"]
 
@@ -131,6 +195,23 @@ def build_cloudflare_block_payloads(
     _emit("brute-force IPs (SSH)", brute_force_ips, "count")
     _emit("error-burst IPs (4xx/5xx)", error_burst_ips, "error_count")
     _emit("sudo-fail users", sudo_fail_ips, "count")
+
+    # Attach a list of filtered local IPs to the first payload so the
+    # operator can see what was excluded.
+    if local_ip_filtered and payloads:
+        payloads[0]["_filtered_local_ips"] = sorted(local_ip_filtered)
+    elif local_ip_filtered:
+        # No payloads emitted (everything was local). Surface the
+        # filtered set so the operator doesn't think the script is broken.
+        payloads.append({
+            "description": f"{description_prefix}: no-op (all suspicious IPs were local)",
+            "mode": "block",
+            "expression": "",
+            "action": "block",
+            "_category": "no-op",
+            "_count": 0,
+            "_filtered_local_ips": sorted(local_ip_filtered),
+        })
 
     return payloads
 

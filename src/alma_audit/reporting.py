@@ -27,25 +27,45 @@ SEVERITY_EMOJI: dict[Severity, str] = {
 # Findings whose `details` dict carries per-IP forensic detail. The
 # Markdown summary pulls only the top 10 entries; the full list lives
 # in `alma-audit-forensic.json`.
+#
+# AISO-200: `probe_paths_by_ip` is intentionally excluded — it's the
+# same IPs as `top_attackers`, just sliced by path instead of by IP.
+# Showing both would duplicate the operator-eye view. The
+# path-by-path breakdown lives in `alma-audit-forensic.json` for
+# forensic consumers.
 _FORENSIC_FIELDS: tuple[str, ...] = (
     "top_attackers",
     "host_errors_top",
     "ssh_fail_details",
     "sudo_fail_details",
-    "probe_paths_by_ip",
 )
 
 
 def _strip_forensic(findings: list[Finding], keep_top: int = 10) -> list[Finding]:
-    """Return a copy of `findings` with forensic fields truncated to top N.
+    """Return a copy of `findings` with forensic fields truncated or removed.
+
+    Behaviour per `_FORENSIC_FIELDS` whitelist:
+
+    - `top_attackers`, `host_errors_top`, `ssh_fail_details`,
+      `sudo_fail_details`: kept inline (top N) so the operator sees
+      the most actionable IPs at a glance.
+    - `probe_paths_by_ip` (AISO-200): REMOVED entirely. It's the same
+      data as `top_attackers`, just sliced by path instead of by IP;
+      the full breakdown lives in `alma-audit-forensic.json`.
 
     The original `details` dict is preserved in full on the main JSON
     report (so machine consumers still see everything); only the
     Markdown rendering strips the long lists.
     """
+    _REMOVED_FIELDS = frozenset({"probe_paths_by_ip"})
+
     out: list[Finding] = []
     for f in findings:
         new_details = dict(f.details or {})
+        # AISO-200: drop fields the Markdown considers redundant with
+        # other top-N fields (probe_paths_by_ip == top_attackers by IP).
+        for field in _REMOVED_FIELDS:
+            new_details.pop(field, None)
         for field in _FORENSIC_FIELDS:
             value = new_details.get(field)
             if isinstance(value, list) and len(value) > keep_top:
@@ -62,24 +82,8 @@ def _strip_forensic(findings: list[Finding], keep_top: int = 10) -> list[Finding
                 truncated = sorted(value, key=_key, reverse=True)[:keep_top]
                 new_details[field] = truncated
                 new_details[f"_{field}_total"] = len(value)
-            elif isinstance(value, dict) and field == "probe_paths_by_ip":
-                # probe_paths_by_ip is a dict-of-lists — top 10 paths
-                # by total hits, with each path list trimmed to top 5 IPs.
-                def _path_hits(path_rows: list[object]) -> int:
-                    return sum(
-                        r.get("count", 0) for r in path_rows if isinstance(r, dict)
-                    )
-                sorted_paths = sorted(
-                    value.items(),
-                    key=lambda kv: _path_hits(kv[1]),
-                    reverse=True,
-                )[:keep_top]
-                new_details[field] = {
-                    path: rows[:5] for path, rows in sorted_paths
-                }
-                new_details["_probe_paths_by_ip_total"] = len(value)
         # Build a new Finding with the trimmed details. Finding is a
-        # frozen dataclass, so we replace it via object.__new__ + setattr.
+        # frozen dataclass, so we replace it via `dataclasses.replace`.
         from dataclasses import replace
         out.append(replace(f, details=new_details))
     return out
@@ -250,15 +254,6 @@ def _render_details_summary(lines: list[str], details: dict) -> None:
                         forensic_subsections.append(f"  - `{ip}` × {count}{suffix}")
                     else:
                         forensic_subsections.append(f"  - `{row}`")
-            elif isinstance(v, dict):
-                for path, rows in list(v.items())[:10]:
-                    if isinstance(rows, list):
-                        top_ip = rows[0].get("ip", "?") if rows else "?"
-                        top_count = rows[0].get("count", 0) if rows else 0
-                        forensic_subsections.append(
-                            f"  - `{path}` — top IP `{top_ip}` × {top_count} "
-                            f"(of {len(rows)} IPs)"
-                        )
         else:
             other_items.append((k, v))
 
@@ -302,6 +297,12 @@ def _render_cloudflare_appendix(lines: list[str], report: AuditReport) -> None:
     payloads = build_cloudflare_block_payloads(report.findings)
     if not payloads:
         return
+
+    # AISO-200: surface the local-IP filter so the operator can see
+    # what was excluded (otherwise 127.0.0.1 / 10.x entries vanish
+    # silently from the block list).
+    filtered = payloads[0].get("_filtered_local_ips", [])
+
     lines.append("## Cloudflare block rules (apply manually)")
     lines.append("")
     lines.append(
@@ -312,12 +313,38 @@ def _render_cloudflare_appendix(lines: list[str], report: AuditReport) -> None:
         "`https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/firewall/rules`."
     )
     lines.append("")
+    if filtered:
+        lines.append(
+            f"**AISO-200 local-IP filter:** {len(filtered)} loopback / private "
+            f"/ link-local / reserved IP(s) excluded from these payloads "
+            f"(see `alma-audit-forensic.json` for the full unfiltered list):"
+        )
+        lines.append("")
+        # Show up to 20 filtered IPs inline; the rest goes in forensic JSON.
+        for ip in filtered[:20]:
+            lines.append(f"  - `{ip}`")
+        if len(filtered) > 20:
+            lines.append(f"  - _... and {len(filtered) - 20} more_")
+        lines.append("")
     for i, p in enumerate(payloads, start=1):
         cat = p.get("_category", f"rule {i}")
         cnt = p.get("_count", 0)
-        body = json.dumps(p, indent=2, ensure_ascii=False)
-        # Strip our internal keys before rendering.
-        body = json.dumps({k: v for k, v in p.items() if not k.startswith("_")}, indent=2, ensure_ascii=False)
+        if not p.get("expression"):
+            # No-op payload (everything was local). Skip the JSON
+            # dump — the "local IP filter" section above already covers
+            # it.
+            lines.append(f"### Rule {i}: {cat}")
+            lines.append("")
+            lines.append(
+                "_No external IPs to block — every suspicious source was "
+                "filtered out as local / private / loopback (see list above)._"
+            )
+            lines.append("")
+            continue
+        body = json.dumps(
+            {k: v for k, v in p.items() if not k.startswith("_")},
+            indent=2, ensure_ascii=False,
+        )
         lines.append(f"### Rule {i}: {cat} ({cnt} entries)")
         lines.append("")
         lines.append("```json")
