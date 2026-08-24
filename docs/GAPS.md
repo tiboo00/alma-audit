@@ -329,10 +329,11 @@ but always "what new file does this belong in".
 | `analyzers/csf_state.py` | 376 | 🟢 ok | single-purpose flat module (AISO-186) |
 | `runners.py` | 349 | 🟢 ok | single responsibility (file-glob runner + injected FS + read_bytes); grew from 284 after AISO-189 quick-win wiring — still well under the 1000-line ceiling |
 | `runner.py` | 239 | 🟢 ok | orchestration only; no detection logic |
-| `cli.py` | 133 | 🟢 ok | argparse + entry; nothing to split |
+| `cli.py` | 164 | 🟢 ok | argparse + entry; prints JSON/MD/Forensic/CF-script output paths |
 | `config.py` | 158 | 🟢 ok | YAML loader + defaults + new quick-win root paths |
 | `ip_normalise.py` | 105 | 🟢 ok | pure utility; do not grow |
-| `reporting.py` | 94 | 🟢 ok | two writers; could split `json_writer.py` / `md_writer.py` if it grows |
+| `reporting.py` | 331 | 🟢 ok | AISO-199 — concise MD (top-10 forensics) + full JSON + forensic JSON + CF bash script |
+| `forensic_export.py` | 294 | 🟢 ok | AISO-199 — per-IP forensic bundle + Cloudflare firewall-rule builder |
 | `models.py` | 55 | 🟢 ok | dataclasses only |
 | `__init__.py` | 3 | 🟢 ok | — |
 

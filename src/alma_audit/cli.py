@@ -23,7 +23,13 @@ from .config import (
     Config,
     load_config,
 )
-from .reporting import build_report, write_json_report, write_markdown_report
+from .reporting import (
+    build_report,
+    write_cloudflare_block_script,
+    write_forensic_report,
+    write_json_report,
+    write_markdown_report,
+)
 from .runner import run_analyzers
 from .runners import RealFileSystem
 
@@ -139,12 +145,15 @@ def main(argv: list[str] | None = None) -> int:
     report = build_report(findings)
     json_path = write_json_report(report, args.output)
     md_path = write_markdown_report(report, args.output)
-    _LOG.info("Reports written: %s, %s", json_path, md_path)
+    forensic_path = write_forensic_report(report, args.output)
+    cf_script_path = write_cloudflare_block_script(report, args.output)
     print(f"alma-audit: {report.summary['total_findings']} findings "
           f"(INFO={report.summary['info']}, WARN={report.summary['warn']}, "
           f"CRITICAL={report.summary['critical']})")
     print(f"  JSON:      {json_path}")
     print(f"  Markdown:  {md_path}")
+    print(f"  Forensic:  {forensic_path}  (per-IP detail + Cloudflare payloads)")
+    print(f"  CF script: {cf_script_path}  (set CF_ZONE_ID + CF_API_TOKEN, then run)")
 
     if report.summary["critical"] > 0 or report.summary["warn"] > 0:
         return 1

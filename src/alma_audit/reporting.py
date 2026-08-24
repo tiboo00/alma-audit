@@ -1,8 +1,10 @@
-"""Reporting layer: JSON + Markdown writers.
+"""Reporting layer: JSON + Markdown writers + forensic export.
 
-The CLI hands a list of Finding objects to the writers. We do not try to
-be clever — these are simple templates. Severity emojis come from the
-existing audit toolkit conventions so reports feel familiar.
+AISO-199: the per-IP forensic detail is split out of the main
+report into `alma-audit-forensic.json`. The Markdown summary stays
+short (counts + top-10 + recommendation), and the operator opens the
+forensic JSON for the full per-IP breakdown — or pipes it into the
+Cloudflare firewall-rule builder for mass-blocking.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import os
 import socket
 from typing import Iterable
 
+from .forensic_export import build_forensic_export
 from .models import AuditReport, Finding, Severity
 
 SEVERITY_EMOJI: dict[Severity, str] = {
@@ -20,6 +23,66 @@ SEVERITY_EMOJI: dict[Severity, str] = {
     Severity.WARN: "⚠️",
     Severity.CRITICAL: "🚨",
 }
+
+# Findings whose `details` dict carries per-IP forensic detail. The
+# Markdown summary pulls only the top 10 entries; the full list lives
+# in `alma-audit-forensic.json`.
+_FORENSIC_FIELDS: tuple[str, ...] = (
+    "top_attackers",
+    "host_errors_top",
+    "ssh_fail_details",
+    "sudo_fail_details",
+    "probe_paths_by_ip",
+)
+
+
+def _strip_forensic(findings: list[Finding], keep_top: int = 10) -> list[Finding]:
+    """Return a copy of `findings` with forensic fields truncated to top N.
+
+    The original `details` dict is preserved in full on the main JSON
+    report (so machine consumers still see everything); only the
+    Markdown rendering strips the long lists.
+    """
+    out: list[Finding] = []
+    for f in findings:
+        new_details = dict(f.details or {})
+        for field in _FORENSIC_FIELDS:
+            value = new_details.get(field)
+            if isinstance(value, list) and len(value) > keep_top:
+                # Sort by count desc when the entries carry a numeric
+                # `count` or `total_probe_requests` field.
+                def _key(r: object) -> int:
+                    if not isinstance(r, dict):
+                        return 0
+                    return (
+                        r.get("count", 0)
+                        or r.get("error_count", 0)
+                        or r.get("total_probe_requests", 0)
+                    )
+                truncated = sorted(value, key=_key, reverse=True)[:keep_top]
+                new_details[field] = truncated
+                new_details[f"_{field}_total"] = len(value)
+            elif isinstance(value, dict) and field == "probe_paths_by_ip":
+                # probe_paths_by_ip is a dict-of-lists — top 10 paths
+                # by total hits, with each path list trimmed to top 5 IPs.
+                def _path_hits(path_rows: list[object]) -> int:
+                    return sum(
+                        r.get("count", 0) for r in path_rows if isinstance(r, dict)
+                    )
+                sorted_paths = sorted(
+                    value.items(),
+                    key=lambda kv: _path_hits(kv[1]),
+                    reverse=True,
+                )[:keep_top]
+                new_details[field] = {
+                    path: rows[:5] for path, rows in sorted_paths
+                }
+                new_details["_probe_paths_by_ip_total"] = len(value)
+        # Build a new Finding with the trimmed details. Finding is a
+        # frozen dataclass, so we replace it via object.__new__ + setattr.
+        from dataclasses import replace
+        out.append(replace(f, details=new_details))
+    return out
 
 
 def build_report(findings: Iterable[Finding], hostname: str | None = None) -> AuditReport:
@@ -42,7 +105,11 @@ def build_report(findings: Iterable[Finding], hostname: str | None = None) -> Au
 
 
 def write_json_report(report: AuditReport, output_dir: str) -> str:
-    """Write the JSON report to <output_dir>/alma-audit-latest.json."""
+    """Write the JSON report to <output_dir>/alma-audit-latest.json.
+
+    The JSON carries the full un-trimmed per-IP forensic detail so
+    machine consumers see everything.
+    """
     path = os.path.join(output_dir, "alma-audit-latest.json")
     os.makedirs(output_dir, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
@@ -50,10 +117,61 @@ def write_json_report(report: AuditReport, output_dir: str) -> str:
     return path
 
 
+def write_forensic_report(report: AuditReport, output_dir: str) -> str:
+    """Write the per-IP forensic JSON to <output_dir>/alma-audit-forensic.json.
+
+    Bundles the scanner IPs, brute-force IPs, error-burst IPs, sudo-fail
+    users, ssh_fail_details, and probe_paths_by_ip into one machine-
+    readable file. Also embeds the Cloudflare firewall-rule payloads
+    and a copy-paste-ready curl script so the operator can mass-block
+    offenders without re-running the audit.
+    """
+    forensic = build_forensic_export(
+        report.findings,
+        hostname=report.hostname,
+        timestamp=report.timestamp,
+    )
+    path = os.path.join(output_dir, "alma-audit-forensic.json")
+    os.makedirs(output_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(forensic, fh, indent=2, ensure_ascii=False)
+    return path
+
+
+def write_cloudflare_block_script(report: AuditReport, output_dir: str) -> str:
+    """Write the bash script that POSTs each rule to Cloudflare.
+
+    The script is generated from the same forensic JSON the audit
+    produces, so it's always in sync with the report. The operator
+    reviews the script, sets CF_ZONE_ID + CF_API_TOKEN, and runs it.
+    """
+    forensic = build_forensic_export(
+        report.findings,
+        hostname=report.hostname,
+        timestamp=report.timestamp,
+    )
+    path = os.path.join(output_dir, "cloudflare-block.sh")
+    os.makedirs(output_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(forensic["cloudflare"]["curl_script"])
+    os.chmod(path, 0o755)
+    return path
+
+
 def write_markdown_report(report: AuditReport, output_dir: str) -> str:
-    """Write a Markdown report to <output_dir>/alma-audit-latest.md."""
+    """Write a CONCISE Markdown report.
+
+    Per-IP forensic detail is intentionally omitted — full breakdown
+    lives in `alma-audit-forensic.json`. The Markdown keeps the top 10
+    entries per forensic field so the operator can skim the report
+    without scrolling through tens of thousands of lines.
+    """
     path = os.path.join(output_dir, "alma-audit-latest.md")
     os.makedirs(output_dir, exist_ok=True)
+
+    # Markdown gets a forensic-trimmed view; JSON gets full detail.
+    markdown_finding_list = _strip_forensic(report.findings, keep_top=10)
+
     lines: list[str] = []
     lines.append(f"# AlmaAudit Report — {report.hostname}")
     lines.append("")
@@ -70,9 +188,9 @@ def write_markdown_report(report: AuditReport, output_dir: str) -> str:
     lines.append("")
     lines.append("## Findings")
     lines.append("")
-    if not report.findings:
+    if not markdown_finding_list:
         lines.append("_No findings._")
-    for f in report.findings:
+    for f in markdown_finding_list:
         emoji = SEVERITY_EMOJI[f.severity]
         lines.append(f"### {emoji} [{f.severity.value}] {f.title}")
         lines.append("")
@@ -81,14 +199,133 @@ def write_markdown_report(report: AuditReport, output_dir: str) -> str:
         if f.recommendation:
             lines.append(f"- **Recommendation:** {f.recommendation}")
         if f.details:
-            lines.append("- **Details:**")
-            lines.append("")
-            lines.append("```json")
-            lines.append(json.dumps(f.details, indent=2, ensure_ascii=False))
-            lines.append("```")
+            _render_details_summary(lines, f.details)
         lines.append("")
         lines.append("---")
         lines.append("")
+    _render_cloudflare_appendix(lines, report)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
     return path
+
+
+def _render_details_summary(lines: list[str], details: dict) -> None:
+    """Render the details block as compact Markdown (no embedded JSON dump).
+
+    Forensic fields are summarised inline (top-10 lists with `...`
+    suffix when truncated); the rest of the details go in a compact
+    JSON block whose line count is bounded by `_MAX_DETAIL_LINES`.
+    """
+    _MAX_DETAIL_LINES = 40
+    forensic_keys = set(_FORENSIC_FIELDS)
+
+    # Render forensic fields inline as a Markdown bullet list, then
+    # note that the full list lives in the forensic JSON file.
+    forensic_subsections: list[str] = []
+    other_items: list[tuple[str, object]] = []
+    for k, v in details.items():
+        if k.startswith("_") and k.endswith("_total"):
+            # Truncation hint rendered alongside the forensic section.
+            continue
+        if k in forensic_keys:
+            forensic_subsections.append(f"- **{k}** (top 10 — full list in `alma-audit-forensic.json`):")
+            total_field = f"_{k}_total"
+            if total_field in details:
+                forensic_subsections.append(
+                    f"  - _Showing 10 of {details[total_field]} entries._"
+                )
+            if isinstance(v, list) and v:
+                for row in v[:10]:
+                    if isinstance(row, dict):
+                        # Render the most informative fields.
+                        ip = row.get("ip") or row.get("user") or row.get("path", "?")
+                        count = (
+                            row.get("count")
+                            or row.get("error_count")
+                            or row.get("total_probe_requests")
+                            or 0
+                        )
+                        ts = row.get("last_seen") or row.get("first_seen") or ""
+                        suffix = f" — last seen: `{ts}`" if ts else ""
+                        forensic_subsections.append(f"  - `{ip}` × {count}{suffix}")
+                    else:
+                        forensic_subsections.append(f"  - `{row}`")
+            elif isinstance(v, dict):
+                for path, rows in list(v.items())[:10]:
+                    if isinstance(rows, list):
+                        top_ip = rows[0].get("ip", "?") if rows else "?"
+                        top_count = rows[0].get("count", 0) if rows else 0
+                        forensic_subsections.append(
+                            f"  - `{path}` — top IP `{top_ip}` × {top_count} "
+                            f"(of {len(rows)} IPs)"
+                        )
+        else:
+            other_items.append((k, v))
+
+    if forensic_subsections:
+        lines.append("- **Forensic summary (top 10 per category):**")
+        lines.append("")
+        lines.extend(forensic_subsections)
+        lines.append("")
+
+    if other_items:
+        # Render the rest of the details as compact JSON, truncated
+        # to `_MAX_DETAIL_LINES` lines. Beyond that, a pointer to the
+        # full forensic JSON.
+        rendered = {k: v for k, v in other_items}
+        dumped = json.dumps(rendered, indent=2, ensure_ascii=False)
+        dumped_lines = dumped.splitlines()
+        if len(dumped_lines) <= _MAX_DETAIL_LINES:
+            lines.append("- **Other details:**")
+            lines.append("")
+            lines.append("```json")
+            lines.append(dumped)
+            lines.append("```")
+        else:
+            head = "\n".join(dumped_lines[:_MAX_DETAIL_LINES])
+            lines.append(
+                f"- **Other details (truncated; see `alma-audit-forensic.json` "
+                f"for full payload, ~{len(dumped_lines) - _MAX_DETAIL_LINES} "
+                f"more lines):**"
+            )
+            lines.append("")
+            lines.append("```json")
+            lines.append(head)
+            lines.append("... (truncated)")
+            lines.append("```")
+
+
+def _render_cloudflare_appendix(lines: list[str], report: AuditReport) -> None:
+    """Append a Cloudflare block-rule summary at the bottom of the MD report."""
+    from .forensic_export import build_cloudflare_block_payloads
+
+    payloads = build_cloudflare_block_payloads(report.findings)
+    if not payloads:
+        return
+    lines.append("## Cloudflare block rules (apply manually)")
+    lines.append("")
+    lines.append(
+        "The audit generated the following Cloudflare firewall rule "
+        "payloads based on the forensic detail. Apply them via the\n"
+        "`cloudflare-block.sh` script in this directory, or POST the\n"
+        "JSON payloads below to\n"
+        "`https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/firewall/rules`."
+    )
+    lines.append("")
+    for i, p in enumerate(payloads, start=1):
+        cat = p.get("_category", f"rule {i}")
+        cnt = p.get("_count", 0)
+        body = json.dumps(p, indent=2, ensure_ascii=False)
+        # Strip our internal keys before rendering.
+        body = json.dumps({k: v for k, v in p.items() if not k.startswith("_")}, indent=2, ensure_ascii=False)
+        lines.append(f"### Rule {i}: {cat} ({cnt} entries)")
+        lines.append("")
+        lines.append("```json")
+        lines.append(body)
+        lines.append("```")
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append(
+        "_Full per-IP forensic detail (no truncation):_ `alma-audit-forensic.json`"
+    )
