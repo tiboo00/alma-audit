@@ -44,6 +44,8 @@ _FIX_FORMATS: tuple = (
 _SCOPE_LABELS: dict = {
     SCOPE_LOCAL_CONFIG: "local_config (.htaccess, sudoers, sshd_config)",
     SCOPE_WAF: "waf (Cloudflare / ModSecurity)",
+    "waf:cflare": "waf: Cloudflare (edge firewall rule)",
+    "waf:modsec": "waf: ModSecurity (app-layer rule)",
     SCOPE_APP_CONFIG: "app_config (Apache httpd.conf, logrotate, fail2ban)",
     SCOPE_DNS_BLOCK: "dns_block (hosts.deny, csf.deny, Cloudflare IP rule)",
     SCOPE_KERNEL_PARAM: "kernel_param (sysctl / sshd_config Protocol)",
@@ -145,16 +147,40 @@ def build_report(findings: Iterable[Finding], hostname: str | None = None) -> Au
     )
 
 
-def write_json_report(report: AuditReport, output_dir: str) -> str:
+def write_json_report(
+    report: AuditReport,
+    output_dir: str,
+    *,
+    fix_format: str = "text",
+) -> str:
     """Write the JSON report to <output_dir>/alma-audit-latest.json.
 
     The JSON carries the full un-trimmed per-IP forensic detail so
     machine consumers see everything.
+
+    AISO-215 (fix_format): ``--fix-format=none`` strips the per-finding
+    ``fixes`` array so ``alma-audit-latest.json`` byte-for-byte matches
+    the pre-AISO-210 output for operators who explicitly opted out. The
+    ``text`` and ``json`` modes both keep the ``fixes`` array on each
+    finding — those operators want the structured recommendations in
+    the JSON (the ``json`` mode discards only the Markdown section;
+    the forensic JSON's top-level ``fixes_recommended`` still ships).
+    ``fix_format`` is range-checked here so a CLI typo fails closed.
     """
+    if fix_format not in _FIX_FORMATS:
+        raise ValueError(
+            f"unknown fix_format {fix_format!r}; expected one of {_FIX_FORMATS}"
+        )
     path = os.path.join(output_dir, "alma-audit-latest.json")
     os.makedirs(output_dir, exist_ok=True)
+    include_fixes = fix_format != _FIX_FORMAT_NONE
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(report.to_dict(), fh, indent=2, ensure_ascii=False)
+        json.dump(
+            report.to_dict(include_fixes=include_fixes),
+            fh,
+            indent=2,
+            ensure_ascii=False,
+        )
     return path
 
 
@@ -183,6 +209,15 @@ def write_forensic_report(
         hostname=report.hostname,
         timestamp=report.timestamp,
     )
+    if fix_format not in _FIX_FORMATS:
+        # AISO-215: range-check BEFORE writing the file. A typo on
+        # the CLI flag (e.g. ``--fix-format=textt``) must fail
+        # closed here too — pre-fix the forensic writer silently
+        # passed through unknown values and emitted the default
+        # (``text``-shaped) output without warning the operator.
+        raise ValueError(
+            f"unknown fix_format {fix_format!r}; expected one of {_FIX_FORMATS}"
+        )
     if fix_format == _FIX_FORMAT_NONE:
         forensic.pop("fixes_recommended", None)
         forensic.pop("fix_scope_order", None)
