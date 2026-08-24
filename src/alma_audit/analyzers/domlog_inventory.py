@@ -66,6 +66,31 @@ REPEAT_RATIO = 0.8
 
 
 # ---------------------------------------------------------------------------
+# AISO-206: severity weights for the `anomalies` list ordering.
+#
+# The aggregator emits findings in filesystem iteration order, which
+# buries the most-dangerous anomalies (shell-metachar injection
+# attempts, exact D7 corpus hits) in the middle of a long tail of
+# "filename too long" reports. We sort the list by `_SORT_WEIGHTS`
+# (most-dangerous first) before rendering, so the operator sees the
+# attack-style anomalies at the top of the JSON / forensic export.
+#
+# The weight is a per-reason integer; the sort key is
+# `(weight, filename)` with `reverse=True`, so ties on weight are
+# broken alphabetically by filename (descending → Z..A within the
+# same weight).
+# ---------------------------------------------------------------------------
+_SORT_WEIGHTS: dict[str, int] = {
+    "shell_metacharacters": 100,            # RCE / injection attempt
+    "contract_pattern_d7": 90,              # corpus-exact, fuzzing pattern
+    "repeated_character_pattern": 70,       # fuzzing artifact
+    "filename_too_long": 50,                # D7 trigger
+    "filename_unusually_long": 30,          # D7 soft trigger
+    "unexpected_filename_shape": 20,        # mild anomaly
+}
+
+
+# ---------------------------------------------------------------------------
 # D7 §4.5.2 — binding detector regex (AISO-119 v1.2 contract).
 #
 # IMPORTANT: This regex is the authoritative "hostdziAAAA..." detector per
@@ -505,7 +530,18 @@ def analyze_domlog_inventory(
                 details={"subdirectories": all_subdirs},
             ))
 
+    # AISO-206: sort anomalies by reason-weight (most-dangerous first), then
+    # alphabetically by filename (ascending). Without this, the list is in
+    # filesystem iteration order, which buries attack-style anomalies
+    # (shell-metachar injection attempts, exact D7 corpus hits) inside a
+    # long tail of "filename too long" reports. Both `alma-audit-latest.json`
+    # (the full report) and `alma-audit-forensic.json` (AISO-199) carry the
+    # same `details.anomalies` payload via `report.findings`, so a single
+    # sort here propagates to both artifacts.
     if all_anomalies:
+        all_anomalies.sort(
+            key=lambda a: (-_SORT_WEIGHTS.get(a["reason"], 0), a["filename"]),
+        )
         crit = sum(1 for a in all_anomalies if a["reason"] in {"filename_too_long", "shell_metacharacters"})
         sev = Severity.CRITICAL if crit else Severity.WARN
         findings.append(Finding(
