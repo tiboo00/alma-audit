@@ -39,6 +39,7 @@ def analyze_cphulk_logs(
     agg = CphulkAggregator()
     files_scanned = 0
     skipped_compressed: list[str] = []
+    unreadable: list[tuple[str, str]] = []  # (path, error str)
 
     for path in paths:
         if is_compressed(path):
@@ -50,7 +51,20 @@ def analyze_cphulk_logs(
         if files_scanned >= settings["max_files"]:
             break
         files_scanned += 1
-        for line in fs.open_text(path, max_lines=cap):
+        # Use `read_text` (strict) so permission denied / I/O error
+        # surfaces here, not silently as "0 lines". Compressed
+        # rotations raise FileNotFoundError (treated as out-of-scope,
+        # not as "unreadable") — see `runners.read_text`.
+        try:
+            raw_lines = fs.read_text(path, max_lines=cap)
+        except FileNotFoundError:
+            files_scanned -= 1
+            continue
+        except OSError as exc:
+            unreadable.append((path, str(exc)))
+            files_scanned -= 1
+            continue
+        for line in raw_lines:
             record = parse_line(line)
             if record is None:
                 line_clean = line.strip()
@@ -60,7 +74,9 @@ def analyze_cphulk_logs(
             agg.add(record)
 
     findings: list[Finding] = []
-    if files_scanned == 0 and not skipped_compressed:
+    if files_scanned == 0 and not skipped_compressed and not unreadable:
+        # No files at all, no unreadable ones — pure "missing log
+        # file" case. Quiet INFO.
         findings.append(Finding(
             module="cphulk_log",
             severity=Severity.INFO,
@@ -86,6 +102,7 @@ def analyze_cphulk_logs(
         details={
             "files_scanned": files_scanned,
             "skipped_compressed": skipped_compressed,
+            "unreadable": [{"path": p, "error": e} for p, e in unreadable],
             **summary,
         },
     ))
@@ -93,5 +110,30 @@ def analyze_cphulk_logs(
     findings.extend(rule_brute_force_by_ip(agg, settings))
     findings.extend(rule_brute_force_by_user(agg, settings))
     findings.extend(rule_block_summary(agg))
+
+    # Surface unreadable files as a structured WARN — same contract
+    # as the secure_log analyzer. Cron-friendly signal that the file
+    # existed but couldn't be read.
+    if unreadable:
+        findings.append(Finding(
+            module="cphulk_log",
+            severity=Severity.WARN,
+            title=f"{len(unreadable)} cphulkd.log file(s) could not be read",
+            description=(
+                "One or more `/var/log/cphulkd.log*` files were present "
+                "but the audit user could not read them (typically a "
+                "permission problem). The scan continued with the "
+                "readable files; brute-force coverage for the "
+                "unreadable range is incomplete."
+            ),
+            details={
+                "unreadable": [{"path": p, "error": e} for p, e in unreadable],
+            },
+            recommendation=(
+                "Grant the audit user read access on the affected "
+                "cphulkd log paths (typically membership in the "
+                "`cpanel` or `wheel` group)."
+            ),
+        ))
 
     return findings

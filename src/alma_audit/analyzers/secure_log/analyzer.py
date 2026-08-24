@@ -47,6 +47,7 @@ def analyze_secure_logs(
     agg = SecureAggregator()
     files_scanned = 0
     skipped_compressed: list[str] = []
+    unreadable: list[tuple[str, str]] = []  # (path, error str)
 
     for path in paths:
         if is_compressed(path):
@@ -61,7 +62,21 @@ def analyze_secure_logs(
         if files_scanned >= settings["max_files"]:
             break
         files_scanned += 1
-        for line in fs.open_text(path, max_lines=cap):
+        # Use the strict `read_text` (vs. permissive `open_text`) so
+        # permission denied / I/O error surfaces here, not silently
+        # as "0 lines". A swallowed-OSError read_text returns `[]` for
+        # compressed rotations (treated as out-of-scope, not as
+        # "unreadable"), so we still record the file as scanned.
+        try:
+            raw_lines = fs.read_text(path, max_lines=cap)
+        except FileNotFoundError:
+            files_scanned -= 1
+            continue
+        except OSError as exc:
+            unreadable.append((path, str(exc)))
+            files_scanned -= 1
+            continue
+        for line in raw_lines:
             record = parse_line(line)
             if record is None:
                 # Don't count a line as malformed until we've actually
@@ -84,7 +99,9 @@ def analyze_secure_logs(
             agg.add(record)
 
     findings: list[Finding] = []
-    if files_scanned == 0 and not skipped_compressed:
+    if files_scanned == 0 and not skipped_compressed and not unreadable:
+        # No files at all, no unreadable ones — pure "missing log
+        # file" case (e.g. syslog isn't writing here). Quiet INFO.
         findings.append(Finding(
             module="secure_log",
             severity=Severity.INFO,
@@ -110,6 +127,7 @@ def analyze_secure_logs(
         details={
             "files_scanned": files_scanned,
             "skipped_compressed": skipped_compressed,
+            "unreadable": [{"path": p, "error": e} for p, e in unreadable],
             **summary,
         },
     ))
@@ -121,5 +139,31 @@ def analyze_secure_logs(
     findings.extend(rule_sudo_failures(agg, settings))
     findings.extend(rule_new_root_account(agg, settings))
     findings.extend(rule_any_user_change(agg))
+
+    # Surface unreadable files as a structured WARN. The summary
+    # finding above already lists them in `details` for grep-ability;
+    # the WARN is the cron-friendly signal so operators don't miss
+    # "the file existed but couldn't be read" because of a silent INFO.
+    if unreadable:
+        findings.append(Finding(
+            module="secure_log",
+            severity=Severity.WARN,
+            title=f"{len(unreadable)} secure/auth log file(s) could not be read",
+            description=(
+                "One or more `/var/log/secure*` or `/var/log/auth.log*` "
+                "files were present but the audit user could not read "
+                "them (typically a permission problem). The scan "
+                "continued with the readable files; coverage for the "
+                "unreadable range is incomplete."
+            ),
+            details={
+                "unreadable": [{"path": p, "error": e} for p, e in unreadable],
+            },
+            recommendation=(
+                "Grant the audit user read access on the affected "
+                "log paths (typically group membership in `adm` or "
+                "explicit `chmod a+r`)."
+            ),
+        ))
 
     return findings

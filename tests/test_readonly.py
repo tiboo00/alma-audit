@@ -9,7 +9,6 @@ import or call to write APIs, no subprocess invocations.
 from __future__ import annotations
 
 import ast
-import os
 import pathlib
 
 PACKAGE_ROOT = pathlib.Path(__file__).resolve().parents[1] / "src" / "alma_audit"
@@ -114,7 +113,7 @@ def test_runners_does_not_open_in_write_mode():
                     if isinstance(kw.value, ast.Constant):
                         mode = kw.value.value
             assert mode is None or "w" not in mode, (
-                f"runners.py opens a file in write mode — forbidden"
+                "runners.py opens a file in write mode — forbidden"
             )
 
 

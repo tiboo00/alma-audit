@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from alma_audit.analyzers.cphulk_log import (
     CphulkAggregator,
     analyze_cphulk_logs,
@@ -121,14 +119,13 @@ def test_aggregator_counts_classified_lines():
 
 def test_analyzer_emits_brute_force_per_ip():
     fs = FakeFileSystem(files={"/var/log/cphulkd.log": SAMPLE_CPHULK})
-    findings = analyze_cphulk_logs(["/var/log/cphulkd.log"], fs)
-    per_ip = [f for f in findings if "1.2.3.4" in f.title]
-    # Default warn threshold is 5; we only have 2 BF events. Override:
-    findings_warn = analyze_cphulk_logs(
+    # Default warn threshold is 5; we only have 2 BF events in
+    # SAMPLE_CPHULK. Override to 2 so the WARN fires.
+    findings = analyze_cphulk_logs(
         ["/var/log/cphulkd.log"], fs,
         rules={"brute_force_warn": 2},
     )
-    per_ip_warn = [f for f in findings_warn if "1.2.3.4" in f.title and "brute-force" in f.title.lower()]
+    per_ip_warn = [f for f in findings if "1.2.3.4" in f.title and "brute-force" in f.title.lower()]
     assert len(per_ip_warn) == 1
     assert per_ip_warn[0].severity == Severity.WARN
 
@@ -191,6 +188,38 @@ def test_analyzer_skips_compressed_files_silently():
     )
     summary = next(f for f in findings if "Scanned" in f.title)
     assert "/var/log/cphulkd.log.1.gz" in summary.details["skipped_compressed"]
+
+
+def test_analyzer_emits_warn_for_unreadable_log_file():
+    """Regression: AISO-188 supervisor finding #2.
+
+    When cphulkd.log exists but cannot be read, emit a structured
+    WARN naming the path. Previously the OSError was swallowed by
+    `open_text()` and the analyzer reported "Scanned 1 file, 0 lines".
+    """
+    import pytest as _pytest
+
+    fs = FakeFileSystem()
+    fs.add_file("/var/log/cphulkd.log", SAMPLE_CPHULK)
+    monkey = _pytest.MonkeyPatch()
+    def _deny(path, max_lines=None):
+        raise PermissionError(13, "Permission denied: cphulkd.log")
+    monkey.setattr(fs, "read_text", _deny)
+    try:
+        findings = analyze_cphulk_logs(["/var/log/cphulkd.log"], fs)
+    finally:
+        monkey.undo()
+    warns = [f for f in findings if f.severity == Severity.WARN]
+    assert any("could not be read" in f.title.lower() for f in warns), (
+        f"Expected unreadable-file WARN; got titles: {[f.title for f in findings]}"
+    )
+    matching = [f for f in warns if "could not be read" in f.title.lower()]
+    paths_in_details = [
+        item["path"]
+        for f in matching
+        for item in f.details.get("unreadable", [])
+    ]
+    assert "/var/log/cphulkd.log" in paths_in_details
 
 
 def test_analyzer_records_malformed_lines():

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from alma_audit.analyzers.csf_state import (
     _count_entries,
     analyze_csf_state,
@@ -60,16 +58,55 @@ def test_count_entries_include_directive():
     assert malformed == []
 
 
-def test_count_entries_collects_malformed_sample():
-    n, malformed = _count_entries([
+def test_count_entries_malformed_flood_does_not_starve_remaining_entries():
+    """Regression: 5 junk lines must NOT terminate the scan.
+
+    Reproduces the AISO-188 supervisor's finding #1 — the old
+    implementation `break`-ed out of the iteration when the
+    malformed-sample reached 5 entries, silently dropping every
+    valid entry that came after. With 250 valid entries trailing,
+    the analyzer's deny_count would have been reported as 0.
+    """
+    from alma_audit.analyzers.csf_state import _count_entries
+
+    lines = ["bad"] * 5 + ["1.2.3.4"] * 250
+    count, malformed = _count_entries(lines)
+    assert count == 250, (
+        f"Expected all 250 valid entries; got {count} — the iteration "
+        "must NOT terminate on the malformed-sample cap."
+    )
+    assert len(malformed) == 5
+
+
+def test_count_entries_malformed_flood_with_1000_junk_lines():
+    """Even a 1000-line junk header followed by 100 valid entries
+    must count the valid entries. This is the security-bypass vector
+    flagged in supervisor finding #1.
+    """
+    from alma_audit.analyzers.csf_state import _count_entries
+
+    lines = ["junk"] * 1000 + ["9.9.9.9"] * 100
+    count, malformed = _count_entries(lines)
+    assert count == 100
+    assert len(malformed) == 5
+
+
+def test_count_entries_include_directive_still_works():
+    """The `Include` directive must keep counting as one entry per
+    occurrence, even when interleaved with malformed lines.
+    """
+    from alma_audit.analyzers.csf_state import _count_entries
+
+    lines = [
+        "Include /etc/csf/csf.blocklist",
+        "bad",
         "1.2.3.4",
-        "this is not an IP",
-        "neither is this",
-        "or this",
-    ])
-    assert n == 1
-    assert len(malformed) == 3
-    assert "this is not an IP" in malformed
+        "Include /etc/csf/csf.allowlist",
+        "also_bad",
+        "5.6.7.8",
+    ]
+    count, _ = _count_entries(lines)
+    assert count == 4  # 2 IPs + 2 Includes
 
 
 def test_count_entries_handles_ipv6():
@@ -263,3 +300,72 @@ def test_analyzer_only_allow_no_deny():
     assert summary.details["allow_count"] == 3
     # No denylist-size finding fires (no deny file scanned).
     assert not any("denylist size" in f.title.lower() for f in findings)
+
+
+def test_analyzer_emits_warn_for_unreadable_csf_deny():
+    """Regression: AISO-188 supervisor finding #2.
+
+    When `csf.deny` exists but cannot be read (PermissionError /
+    OSError), the analyzer must emit a structured WARN naming the
+    file. Previously the permissive `open_text()` swallowed the
+    OSError and the analyzer reported "0 entries" — letting a chmod
+    000 csf.deny silently mask the true denylist size.
+    """
+    fs = FakeFileSystem()
+    fs.add_file("/etc/csf/csf.deny", "1.2.3.4\n")
+    # Simulate a chmod-000 by patching the strict read_text to raise.
+    import pytest as _pytest  # local alias to avoid name shadowing
+    _monkey = _pytest.MonkeyPatch()
+    def _deny(path, max_lines=None):
+        raise PermissionError(13, "Permission denied: csf.deny")
+    _monkey.setattr(fs, "read_text", _deny)
+    try:
+        findings = analyze_csf_state(
+            ["/etc/csf/csf.deny"], ["/etc/csf/csf.allow"], fs,
+        )
+    finally:
+        _monkey.undo()
+    # Find the WARN finding.
+    warns = [f for f in findings if f.severity == Severity.WARN]
+    assert any("could not be read" in f.title.lower() for f in warns), (
+        f"Expected unreadable-file WARN; got titles: {[f.title for f in findings]}"
+    )
+    # The WARN should name the path in its details.
+    matching = [f for f in warns if "could not be read" in f.title.lower()]
+    paths_in_details = [
+        item["path"]
+        for f in matching
+        for item in f.details.get("deny_unreadable", [])
+    ]
+    assert "/etc/csf/csf.deny" in paths_in_details
+
+
+def test_analyzer_unreadable_warn_keeps_successful_findings():
+    """Unreadable WARN must not block the success-path findings.
+
+    One deny file unreadable + one allow file readable → INFO
+    summary + WARN about unreadable. The allow count is still
+    emitted correctly.
+    """
+    fs = FakeFileSystem()
+    fs.add_file("/etc/csf/csf.deny", "1.2.3.4\n")
+    fs.add_file("/etc/csf/csf.allow", "5.6.7.8\n")
+    import pytest as _pytest
+    _monkey = _pytest.MonkeyPatch()
+    def _deny(path, max_lines=None):
+        if path.endswith("/csf.deny"):
+            raise PermissionError(13, "Permission denied")
+        return fs.open_text(path, max_lines=max_lines)
+    _monkey.setattr(fs, "read_text", _deny)
+    try:
+        findings = analyze_csf_state(
+            ["/etc/csf/csf.deny"], ["/etc/csf/csf.allow"], fs,
+        )
+    finally:
+        _monkey.undo()
+    summary = next(f for f in findings if "CSF state" in f.title)
+    assert summary.details["allow_count"] == 1
+    assert any(
+        "could not be read" in f.title.lower() and f.severity == Severity.WARN
+        for f in findings
+    )

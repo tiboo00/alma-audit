@@ -24,8 +24,6 @@ from __future__ import annotations
 import os
 import stat
 
-import pytest
-
 from alma_audit.analyzers.access_log import analyze_access_logs
 from alma_audit.models import Severity
 from alma_audit.runners import RealFileSystem
@@ -350,7 +348,6 @@ def test_unreadable_domlog_root_emits_warn_finding(
     domlog_root.mkdir()
 
     fs = RealFileSystem()
-    import alma_audit.runners as runners_mod
 
     def _deny(_path: str) -> list[str]:
         raise PermissionError(13, "Permission denied")

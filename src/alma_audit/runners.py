@@ -20,6 +20,7 @@ class FileSystem(Protocol):
     def listdir(self, path: str) -> list[str]: ...
     def is_readable_dir(self, path: str) -> bool: ...
     def open_text(self, path: str, max_lines: int | None = None) -> list[str]: ...
+    def read_text(self, path: str, max_lines: int | None = None) -> list[str]: ...
     def read_bytes(self, path: str, max_bytes: int | None = None) -> bytes: ...
     def glob(self, root: str, pattern: str) -> list[str]: ...
 
@@ -73,6 +74,13 @@ class RealFileSystem:
         Compressed extensions (`.gz`, `.bz2`, `.xz`, `.zst`) are
         skipped silently — opening them in text mode would error and
         the contract is read-only, so we can't shell out to `gunzip`.
+
+        **Permissive read:** OSError (PermissionError, IsADirectory,
+        bad encoding, ...) is swallowed and `[]` is returned. Use
+        `read_text` instead when the analyzer needs to distinguish
+        "unreadable file" from "empty file" — that's the right tool
+        for the secure_log / cphulk_log / csf_state unreadable-WARN
+        rules.
         """
         # Skip compressed rotations — readable text-mode requires an
         # out-of-process decompressor (forbidden by the read-only
@@ -103,6 +111,42 @@ class RealFileSystem:
             # Permission denied, IsADirectory, bad encoding, etc.
             # — treat as "no lines" so the analyzer doesn't blow up.
             return []
+
+    def read_text(self, path: str, max_lines: int | None = None) -> list[str]:
+        """Strict counterpart to `open_text`: raises on unreadable input.
+
+        Unlike `open_text`, this method does NOT swallow OSError. The
+        analyzer layer can wrap it in `try/except OSError` to emit a
+        structured WARN finding for permission-denied / I/O-error /
+        missing-file cases.
+
+        Compressed extensions (`.gz`, `.bz2`, `.xz`, `.zst`) raise
+        `FileNotFoundError` (treated as "this rotated copy is not in
+        scope of the text decoder") so the caller can distinguish
+        "skip me" from "I'm broken".
+
+        `max_lines` mirrors `open_text`; `None` means read everything.
+        """
+        lower = path.lower()
+        for ext in (".gz", ".bz2", ".xz", ".zst", ".lz4"):
+            if lower.endswith(ext):
+                # The runner layer treats compressed rotations as
+                # out-of-scope for the text decoder. We raise
+                # FileNotFoundError so the analyzer can skip without
+                # logging a WARN — same contract as a missing file.
+                raise FileNotFoundError(
+                    f"compressed rotation {path!r} not readable by text decoder"
+                )
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            if max_lines is None:
+                return fh.read().splitlines()
+            lines: list[str] = []
+            for _ in range(max_lines):
+                try:
+                    lines.append(next(fh))
+                except StopIteration:
+                    break
+            return lines
 
     def read_bytes(self, path: str, max_bytes: int | None = None) -> bytes:
         """Read the file as bytes. Returns b'' if unreadable.
@@ -244,7 +288,7 @@ class FakeFileSystem:
 
         If the file was registered with `add_bytes` (binary mode),
         we decode it as UTF-8 for tests that want to exercise both
-        paths from a single fixture.
+        paths from the same fixture.
         """
         key = self._norm(path)
         if key in self._bytes:
@@ -257,6 +301,27 @@ class FakeFileSystem:
         if max_lines is None:
             return list(lines)
         return list(lines)[:max_lines]
+
+    def read_text(self, path: str, max_lines: int | None = None) -> list[str]:
+        """Strict counterpart to `open_text` for FakeFileSystem.
+
+        Behaviourally identical to `open_text` here (the fake is in
+        memory; either method raises `FileNotFoundError` for missing
+        paths). Tests that need to simulate an unreadable file
+        override this method on the instance, e.g.:
+
+            monkeypatch.setattr(
+                fs, "read_text",
+                lambda p, **kw: (_ for _ in ()).throw(
+                    PermissionError(13, "Permission denied")
+                ),
+            )
+
+        Or, more cleanly, by patching the instance with a function
+        that raises. The default raises FileNotFoundError for missing
+        paths so analyzer-level `try/except OSError` keeps working.
+        """
+        return self.open_text(path, max_lines=max_lines)
 
     def read_bytes(self, path: str, max_bytes: int | None = None) -> bytes:
         """Return the raw bytes of the file.

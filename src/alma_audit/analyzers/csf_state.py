@@ -40,6 +40,48 @@ from ..runners import FileSystem
 
 _LOG = logging.getLogger("alma_audit")
 
+
+def _emit_unreadable_warn(
+    findings: list[Finding],
+    deny_unreadable: list[tuple[str, str]],
+    allow_unreadable: list[tuple[str, str]],
+) -> None:
+    """Emit a single WARN covering both deny + allow unreadable paths.
+
+    A chmod-000 /etc/csf/csf.deny used to silently degrade the
+    analyzer to "0 entries" without any operator signal — the WARN
+    closes that gap and gives the cron-fail-loud path (CLI exits 1
+    on any WARN/CRITICAL) a hook to fire.
+    """
+    total = len(deny_unreadable) + len(allow_unreadable)
+    if total == 0:
+        return
+    findings.append(Finding(
+        module="csf_state",
+        severity=Severity.WARN,
+        title=f"{total} CSF state file(s) could not be read",
+        description=(
+            "One or more `csf.deny` / `csf.allow` files were present "
+            "but the audit user could not read them (typically a "
+            "permission problem). The reported counts may understate "
+            "the real denylist size — operators should verify before "
+            "treating an INFO summary as authoritative."
+        ),
+        details={
+            "deny_unreadable": [
+                {"path": p, "error": e} for p, e in deny_unreadable
+            ],
+            "allow_unreadable": [
+                {"path": p, "error": e} for p, e in allow_unreadable
+            ],
+        },
+        recommendation=(
+            "Grant the audit user read access on the affected CSF "
+            "state files (typically membership in the `wheel` group "
+            "or `chmod a+r /etc/csf/csf.*`)."
+        ),
+    ))
+
 # A "real" CSF entry is either an IPv4 dotted quad, an IPv6 literal,
 # or a CIDR (one of the above with `/N` suffix). Comments start with
 # `#` and empty lines are skipped. We accept any non-empty,
@@ -55,8 +97,14 @@ def _count_entries(lines: list[str]) -> tuple[int, list[str]]:
 
     A "valid" entry is a non-empty, non-comment line that begins with
     what looks like an IP / CIDR. Lines that don't fit either pattern
-    are added to `malformed_sample` (capped at 5) so the analyzer can
-    surface a soft WARN when the format drifts.
+    are added to `malformed_sample` (capped at `_MALFORMED_SAMPLE_CAP`)
+    so the analyzer can surface a soft WARN when the format drifts.
+
+    The malformed-sample cap MUST NOT terminate the iteration: csf.deny
+    files with many junk lines (e.g. pasted from a wiki) would otherwise
+    skip every entry after the 5th, allowing a malicious or accidental
+    overflow to bypass the warn/crit thresholds. We continue scanning
+    the full input.
     """
     count = 0
     malformed: list[str] = []
@@ -75,10 +123,18 @@ def _count_entries(lines: list[str]) -> tuple[int, list[str]]:
         if _CIDR_RE.match(line):
             count += 1
             continue
-        malformed.append(line)
-        if len(malformed) >= 5:
-            break
+        # Append to the sample but DO NOT break — keep scanning so a
+        # malformed-line flood cannot starve the analyzer of the rest
+        # of the entries. Cap the *sample* on append (cheap guard).
+        if len(malformed) < _MALFORMED_SAMPLE_CAP:
+            malformed.append(line)
     return count, malformed
+
+
+# How many malformed lines to keep in the diagnostic sample. The cap
+# is for the operator-facing report (5 lines is plenty for "the format
+# drifted") — it does NOT truncate iteration.
+_MALFORMED_SAMPLE_CAP = 5
 
 
 def analyze_csf_state(
@@ -107,16 +163,26 @@ def analyze_csf_state(
     deny_total = 0
     deny_files_scanned = 0
     deny_malformed: list[str] = []
+    deny_unreadable: list[tuple[str, str]] = []
     for path in deny_paths:
         if not fs.is_file(path):
             continue
         deny_files_scanned += 1
+        # Use `read_text` (strict) so permission denied / I/O error
+        # surfaces here. The previous permissive `open_text` swallowed
+        # OSError and returned `[]`, which silently turned a
+        # permission-denied file into a "0 entries" count —
+        # letting an operator with a restrictive audit-user mask bypass
+        # the warn/crit thresholds by accident or by design.
         try:
-            lines = fs.open_text(path)
+            lines = fs.read_text(path)
         except FileNotFoundError:
+            deny_files_scanned -= 1
             continue
         except OSError as exc:
-            _LOG.warning("csf_state: open_text(%s) failed: %s", path, exc)
+            _LOG.warning("csf_state: read_text(%s) failed: %s", path, exc)
+            deny_unreadable.append((path, str(exc)))
+            deny_files_scanned -= 1
             continue
         count, malformed = _count_entries(lines)
         deny_total += count
@@ -124,21 +190,25 @@ def analyze_csf_state(
 
     allow_total = 0
     allow_files_scanned = 0
+    allow_unreadable: list[tuple[str, str]] = []
     for path in allow_paths:
         if not fs.is_file(path):
             continue
         allow_files_scanned += 1
         try:
-            lines = fs.open_text(path)
+            lines = fs.read_text(path)
         except FileNotFoundError:
+            allow_files_scanned -= 1
             continue
         except OSError as exc:
-            _LOG.warning("csf_state: open_text(%s) failed: %s", path, exc)
+            _LOG.warning("csf_state: read_text(%s) failed: %s", path, exc)
+            allow_unreadable.append((path, str(exc)))
+            allow_files_scanned -= 1
             continue
         count, _ = _count_entries(lines)
         allow_total += count
 
-    if deny_files_scanned == 0 and allow_files_scanned == 0:
+    if deny_files_scanned == 0 and allow_files_scanned == 0 and not deny_unreadable and not allow_unreadable:
         findings.append(Finding(
             module="csf_state",
             severity=Severity.INFO,
@@ -150,6 +220,12 @@ def analyze_csf_state(
             ),
             details={"deny_paths": list(deny_paths), "allow_paths": list(allow_paths)},
         ))
+        # Surface the unreadable paths here too, so the operator
+        # sees the WARN before we return.
+        if deny_unreadable or allow_unreadable:
+            _emit_unreadable_warn(
+                findings, deny_unreadable, allow_unreadable,
+            )
         return findings
 
     # ---- INFO summary ----
@@ -168,6 +244,8 @@ def analyze_csf_state(
             "deny_count": deny_total,
             "allow_count": allow_total,
             "baseline": settings.get("deny_baseline"),
+            "deny_unreadable": [{"path": p, "error": e} for p, e in deny_unreadable],
+            "allow_unreadable": [{"path": p, "error": e} for p, e in allow_unreadable],
         },
     ))
 
@@ -277,5 +355,10 @@ def analyze_csf_state(
                 "it but does not recurse into the linked file."
             ),
         ))
+
+    # ---- unreadable files (D20) — strict read_text surfaces I/O
+    # errors here. Without this WARN, a chmod-000 csf.deny would
+    # silently look like a healthy empty denylist. ----
+    _emit_unreadable_warn(findings, deny_unreadable, allow_unreadable)
 
     return findings

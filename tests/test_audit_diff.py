@@ -9,12 +9,9 @@ that an operator would notice in cron logs.
 from __future__ import annotations
 
 import importlib.util
-import io
 import json
-import os
 import pathlib
 import sys
-from contextlib import redirect_stdout
 
 import pytest
 

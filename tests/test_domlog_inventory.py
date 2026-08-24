@@ -78,7 +78,6 @@ def test_subdirectory_is_flagged():
         f"{DOMLOG_ROOT}/hostdzire.com": "log",
     })
     findings = analyze_domlog_inventory(DOMLOG_ROOT, fs)
-    sub_findings = [f for f in findings if "sub-directory" in f.title.lower() or "sub-directory" in f.title.lower() or "sub" in f.title.lower()]
     # Either a sub-dir finding OR an anomaly finding is fine — what we
     # care about is that the layout doesn't pass silently.
     assert any(f.severity in (Severity.WARN, Severity.CRITICAL) for f in findings)

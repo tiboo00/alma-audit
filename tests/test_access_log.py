@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from alma_audit.analyzers.access_log import (
     AccessAggregator,
     analyze_access_logs,

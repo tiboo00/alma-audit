@@ -122,11 +122,37 @@ def test_aggregator_counts_certs_and_malformed():
 # --- analyzer -------------------------------------------------------------
 
 
-def test_analyzer_missing_cryptography_dependency(tmp_path):
-    """If `cryptography` is not importable, emit a single WARN."""
+def test_analyzer_missing_cryptography_dependency_is_silent_without_roots(tmp_path):
+    """If `cryptography` is missing AND no cert roots match on disk,
+    the analyzer emits nothing — a default `pip install alma-audit`
+    (without `[ssl]`) on a non-cPanel host must be cron-clean.
+    """
     from unittest.mock import patch
 
     fs = FakeFileSystem()
+    # No cert roots registered. `_discover_any_root_has_matches`
+    # returns False, so the dependency-WARN is suppressed.
+    with patch(
+        "alma_audit.analyzers.ssl_cert.analyzer.cryptography_available",
+        return_value=False,
+    ):
+        findings = analyze_ssl_certs(["/var/cpanel/ssl"], fs)
+    assert findings == []
+
+
+def test_analyzer_missing_cryptography_dependency_warns_when_certs_exist(tmp_path):
+    """If `cryptography` is missing AND a cert root has matching
+    files on disk, the analyzer emits a single WARN naming the
+    missing dependency — operators see why the module produced
+    zero findings.
+    """
+    from unittest.mock import patch
+
+    # Register a PEM cert under the only cert root.
+    pem = _make_cert_pem()
+    fs = FakeFileSystem()
+    fs.add_bytes("/var/cpanel/ssl/example.pem", pem)
+
     with patch(
         "alma_audit.analyzers.ssl_cert.analyzer.cryptography_available",
         return_value=False,

@@ -45,6 +45,41 @@ def cryptography_available() -> bool:
         return False
 
 
+def _discover_any_root_has_matches(
+    roots: Iterable[str],
+    patterns: list[str],
+    fs: FileSystem,
+) -> bool:
+    """True iff at least one root contains a glob-matched file.
+
+    Cheap probe used to decide whether the missing-cryptography
+    WARN is worth emitting: if no cert roots match on disk, a
+    default `pip install alma-audit` on a non-cPanel host would
+    otherwise produce a cron-fail-loud WARN even when there is
+    nothing for the module to do.
+
+    The probe respects the same per-root checks as the main loop
+    (`is_dir` + `is_readable_dir` + `is_file`) so we never report a
+    match for a path the analyzer wouldn't actually try to read.
+    """
+    for root in roots:
+        if not fs.is_dir(root):
+            continue
+        if not fs.is_readable_dir(root):
+            continue
+        try:
+            entries = fs.listdir(root)
+        except OSError:
+            continue
+        for name in entries:
+            if not any(fnmatch.fnmatchcase(name, pat) for pat in patterns):
+                continue
+            full = f"{root.rstrip('/')}/{name}"
+            if fs.is_file(full):
+                return True
+    return False
+
+
 def analyze_ssl_certs(
     roots: Iterable[str] | None,
     fs: FileSystem,
@@ -62,6 +97,16 @@ def analyze_ssl_certs(
     matches everything (`*`). Operators usually want to filter for
     `*.pem`, `*.crt`, `*.cert` to avoid scanning every file in
     `/etc/pki/tls/certs/` (which mixes symlinks, openssl configs, etc.).
+
+    Dependency opt-in: the optional `cryptography` package is required
+    to actually parse PEM bytes. If it is missing AND we discover at
+    least one glob-matched cert file we would otherwise try to parse,
+    we emit a single WARN so operators know why this module produced
+    zero findings. If no cert roots match on disk, the analyzer
+    silently emits an INFO "no certificate directory found" finding
+    — the absence of `cryptography` is irrelevant when there's
+    nothing to parse, which keeps a default `pip install alma-audit`
+    (without `[ssl]`) cron-clean on a non-cPanel host.
     """
     settings = {**DEFAULT_RULES, **(rules or {})}
     actual_roots = list(roots) if roots is not None else list(SSL_CERT_GLOB_ROOTS)
@@ -69,24 +114,30 @@ def analyze_ssl_certs(
     findings: list[Finding] = []
 
     if not cryptography_available():
-        # The dependency is optional; without it the analyzer can't do
-        # anything useful. Emit a single WARN so operators see why the
-        # report has zero findings from this module.
-        findings.append(Finding(
-            module="ssl_cert",
-            severity=Severity.WARN,
-            title="cryptography dependency is not installed",
-            description=(
-                "The optional `cryptography` package is required for "
-                "X.509 parsing. Install it with "
-                "`pip install 'alma-audit[ssl]'` (or "
-                "`pip install cryptography`)."
-            ),
-            recommendation=(
-                "Run `pip install cryptography` (or the `[ssl]` extra) "
-                "and re-run alma-audit to enable cert expiry detection."
-            ),
-        ))
+        # Discovery pass: only emit the dependency-WARN if there is
+        # actually a cert root on disk we'd otherwise scan. Otherwise
+        # a default `pip install alma-audit` (without `[ssl]`) on a
+        # non-cPanel host would always produce a cron-fail-loud WARN,
+        # even when there is nothing for the module to do.
+        if _discover_any_root_has_matches(
+            actual_roots, actual_patterns, fs,
+        ):
+            findings.append(Finding(
+                module="ssl_cert",
+                severity=Severity.WARN,
+                title="cryptography dependency is not installed",
+                description=(
+                    "The optional `cryptography` package is required for "
+                    "X.509 parsing. Install it with "
+                    "`pip install 'alma-audit[ssl]'` (or "
+                    "`pip install cryptography`). The analyzer discovered "
+                    "cert files on this host but could not parse them."
+                ),
+                recommendation=(
+                    "Run `pip install cryptography` (or the `[ssl]` extra) "
+                    "and re-run alma-audit to enable cert expiry detection."
+                ),
+            ))
         return findings
 
     agg = CertAggregator()

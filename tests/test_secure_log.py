@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-import datetime
-
-import pytest
-
 from alma_audit.analyzers.secure_log import (
     SecureAggregator,
     analyze_secure_logs,
@@ -234,6 +230,55 @@ def test_analyzer_skips_compressed_files_silently():
     )
     summary = next(f for f in findings if "Scanned" in f.title)
     assert "/var/log/secure.1.gz" in summary.details["skipped_compressed"]
+
+
+def test_analyzer_emits_warn_for_unreadable_log_file():
+    """Regression: AISO-188 supervisor finding #2.
+
+    When the secure/auth log exists but the audit user cannot read
+    it (PermissionError), the analyzer must emit a structured WARN
+    naming the path. Previously the permissive `open_text()` swallowed
+    the OSError and the analyzer reported "Scanned 1 file, 0 lines".
+    """
+    import pytest as _pytest
+
+    fs = FakeFileSystem()
+    fs.add_file("/var/log/secure", SAMPLE_SECURE)
+    monkey = _pytest.MonkeyPatch()
+    def _deny(path, max_lines=None):
+        raise PermissionError(13, "Permission denied: /var/log/secure")
+    monkey.setattr(fs, "read_text", _deny)
+    try:
+        findings = analyze_secure_logs(["/var/log/secure"], fs)
+    finally:
+        monkey.undo()
+    warns = [f for f in findings if f.severity == Severity.WARN]
+    assert any("could not be read" in f.title.lower() for f in warns), (
+        f"Expected unreadable-file WARN; got titles: {[f.title for f in findings]}"
+    )
+    matching = [f for f in warns if "could not be read" in f.title.lower()]
+    paths_in_details = [
+        item["path"]
+        for f in matching
+        for item in f.details.get("unreadable", [])
+    ]
+    assert "/var/log/secure" in paths_in_details
+
+
+def test_analyzer_no_warn_when_compressed_file():
+    """Compressed rotations raise FileNotFoundError, NOT OSError.
+    The strict read_text treats them as out-of-scope (skipped),
+    not as unreadable — so they don't generate a WARN.
+    """
+    fs = FakeFileSystem(files={
+        "/var/log/secure.1.gz": SAMPLE_SECURE,
+        "/var/log/secure": SAMPLE_SECURE,
+    })
+    findings = analyze_secure_logs(
+        ["/var/log/secure.1.gz", "/var/log/secure"], fs,
+    )
+    warns = [f for f in findings if f.severity == Severity.WARN]
+    assert not any("could not be read" in f.title.lower() for f in warns)
 
 
 def test_analyzer_respects_max_files_cap():

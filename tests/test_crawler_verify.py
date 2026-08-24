@@ -26,8 +26,6 @@ This test file locks the contract guarantees for `verify_crawler`:
 
 from __future__ import annotations
 
-import socket
-
 import pytest
 
 from alma_audit.analyzers.crawler_verify import (
@@ -39,7 +37,6 @@ from alma_audit.analyzers.crawler_verify import (
     NOT_APPLICABLE,
     PTR_ERROR,
     SUFFIX_MISMATCH,
-    Resolver,
     SocketResolver,
     verify_crawler,
 )

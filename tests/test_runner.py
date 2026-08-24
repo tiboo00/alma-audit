@@ -47,3 +47,30 @@ def test_run_analyzers_respects_module_overrides():
     # With a high threshold, no probe finding should fire
     probe_findings = [f for f in findings if "probe" in f.title.lower()]
     assert probe_findings == []
+
+
+def test_run_analyzers_silent_when_cryptography_missing_and_no_cert_roots():
+    """Regression: a default install without `[ssl]` must NOT emit a
+    WARN when no cert roots exist on disk. Without this guard, every
+    cron run on a non-cPanel host would exit 1 — defeating the
+    INFO-only / cron-clean contract.
+    """
+    from unittest.mock import patch
+
+    fs = FakeFileSystem()  # nothing — no cert roots, no log files
+    cfg = Config()
+    with patch(
+        "alma_audit.analyzers.ssl_cert.analyzer.cryptography_available",
+        return_value=False,
+    ):
+        findings = run_analyzers(cfg, fs)
+    # The only finding should be the "no cert directory" INFO.
+    # No WARN about cryptography-missing.
+    cryptography_warns = [
+        f for f in findings
+        if f.module == "ssl_cert" and "cryptography" in f.title.lower()
+    ]
+    assert cryptography_warns == []
+    # And no CRITICAL / non-INFO findings overall.
+    from alma_audit.models import Severity
+    assert all(f.severity == Severity.INFO for f in findings)
