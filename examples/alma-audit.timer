@@ -1,0 +1,17 @@
+[Unit]
+Description=alma-audit daily timer
+Documentation=https://example.invalid/alma-audit
+
+[Timer]
+# Run at 04:15 every day. cron-equivalent:
+#   15 4 * * * /usr/local/bin/alma-audit
+OnCalendar=*-*-* 04:15:00
+# If the host was off when the timer should have fired, run once at boot.
+Persistent=true
+# Randomize the start within a 5-minute window to avoid thundering-herd
+# across many hosts.
+RandomizedDelaySec=300
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,125 @@
+"""Public entry point for the secure_log analyzer.
+
+Orchestrates the parser, aggregator, and rules. Reads files via the
+injected `FileSystem` (read-only contract enforced upstream), respects
+`max_files` and `max_lines_per_file` caps, and dispatches the four
+rules in D8/D9/D10/D11 order. Returns a flat list of `Finding`.
+
+External callers import `analyze_secure_logs` from this module; the
+package re-exports the public API in `__init__.py`.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Iterable
+
+from ...models import Finding, Severity
+from ...runners import FileSystem
+from .aggregator import SecureAggregator
+from .parser import parse_line
+from .rules import (
+    rule_any_user_change,
+    rule_new_root_account,
+    rule_ssh_brute_force,
+    rule_sudo_failures,
+)
+from .settings import DEFAULT_RULES, is_compressed
+
+_LOG = logging.getLogger("alma_audit")
+
+
+def analyze_secure_logs(
+    paths: Iterable[str],
+    fs: FileSystem,
+    rules: dict[str, Any] | None = None,
+) -> list[Finding]:
+    """Run the secure/auth.log analyzer across `paths` and emit findings.
+
+    Each `path` is opened via the injected `FileSystem` (read-only
+    contract is enforced upstream). Compressed rotations (`.gz`,
+    `.bz2`, `.xz`, `.zst`) are listed in a `skipped_compressed` block
+    on the summary finding, not silently dropped — operators need the
+    forensic trail when older data is not inspected.
+    """
+    settings = {**DEFAULT_RULES, **(rules or {})}
+    cap = settings["max_lines_per_file"] or None
+    agg = SecureAggregator()
+    files_scanned = 0
+    skipped_compressed: list[str] = []
+
+    for path in paths:
+        if is_compressed(path):
+            skipped_compressed.append(path)
+            continue
+        if not fs.is_file(path):
+            continue
+        # Honour the cap BEFORE reading the file. The pre-increment
+        # check guarantees `files_scanned` is the actual number of
+        # files opened, not "files attempted" (which would include
+        # the one we skipped).
+        if files_scanned >= settings["max_files"]:
+            break
+        files_scanned += 1
+        for line in fs.open_text(path, max_lines=cap):
+            record = parse_line(line)
+            if record is None:
+                # Don't count a line as malformed until we've actually
+                # failed to classify a service-tag line; pure noise
+                # like `cron: ...` shouldn't pollute the counter.
+                # parse_line returns None for both noise and unknown
+                # service-tagged lines. We treat any non-empty line
+                # with a service tag as a candidate; the parser
+                # already returns None for both. The contract is that
+                # the parser is exact: the counter is bumped only when
+                # a line was attempted and rejected, which is what
+                # `agg.note_malformed` records. To keep that contract
+                # honest we count ALL non-empty lines that failed to
+                # classify — the operator sees the ratio in the
+                # summary finding.
+                line_clean = line.strip()
+                if line_clean:
+                    agg.note_malformed()
+                continue
+            agg.add(record)
+
+    findings: list[Finding] = []
+    if files_scanned == 0 and not skipped_compressed:
+        findings.append(Finding(
+            module="secure_log",
+            severity=Severity.INFO,
+            title="No secure/auth log files matched",
+            description=(
+                "No `/var/log/secure*` or `/var/log/auth.log*` files "
+                "were found. Either syslog is configured to log "
+                "elsewhere, or the audit user cannot see these files."
+            ),
+            details={"scanned_paths": list(paths)},
+        ))
+        return findings
+
+    summary = agg.finalize()
+    findings.append(Finding(
+        module="secure_log",
+        severity=Severity.INFO,
+        title=(
+            f"Scanned {files_scanned} secure/auth log file(s), "
+            f"{summary['classified_lines']} classified line(s)"
+        ),
+        description="Secure/auth log scan complete.",
+        details={
+            "files_scanned": files_scanned,
+            "skipped_compressed": skipped_compressed,
+            **summary,
+        },
+    ))
+
+    # Order: brute-force first (most common), then sudo, then the
+    # always-CRITICAL root-account rule, then the catch-all
+    # account-change summary.
+    findings.extend(rule_ssh_brute_force(agg, settings))
+    findings.extend(rule_sudo_failures(agg, settings))
+    findings.extend(rule_new_root_account(agg, settings))
+    findings.extend(rule_any_user_change(agg))
+
+    return findings

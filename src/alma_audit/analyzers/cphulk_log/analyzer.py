@@ -1,0 +1,97 @@
+"""Public entry point for the cphulk_log analyzer.
+
+Orchestrates the parser, aggregator, and rules. Reads files via the
+injected `FileSystem` (read-only contract enforced upstream), respects
+`max_files` and `max_lines_per_file` caps, and dispatches the three
+rules in D14/D15/D16 order. Returns a flat list of `Finding`.
+
+External callers import `analyze_cphulk_logs` from this module; the
+package re-exports the public API in `__init__.py`.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Iterable
+
+from ...models import Finding, Severity
+from ...runners import FileSystem
+from .aggregator import CphulkAggregator
+from .parser import parse_line
+from .rules import (
+    rule_block_summary,
+    rule_brute_force_by_ip,
+    rule_brute_force_by_user,
+)
+from .settings import DEFAULT_RULES, is_compressed
+
+_LOG = logging.getLogger("alma_audit")
+
+
+def analyze_cphulk_logs(
+    paths: Iterable[str],
+    fs: FileSystem,
+    rules: dict[str, Any] | None = None,
+) -> list[Finding]:
+    """Run the cphulk_log analyzer across `paths` and emit findings."""
+    settings = {**DEFAULT_RULES, **(rules or {})}
+    cap = settings["max_lines_per_file"] or None
+    agg = CphulkAggregator()
+    files_scanned = 0
+    skipped_compressed: list[str] = []
+
+    for path in paths:
+        if is_compressed(path):
+            skipped_compressed.append(path)
+            continue
+        if not fs.is_file(path):
+            continue
+        # Honour the cap BEFORE reading the file.
+        if files_scanned >= settings["max_files"]:
+            break
+        files_scanned += 1
+        for line in fs.open_text(path, max_lines=cap):
+            record = parse_line(line)
+            if record is None:
+                line_clean = line.strip()
+                if line_clean:
+                    agg.note_malformed()
+                continue
+            agg.add(record)
+
+    findings: list[Finding] = []
+    if files_scanned == 0 and not skipped_compressed:
+        findings.append(Finding(
+            module="cphulk_log",
+            severity=Severity.INFO,
+            title="No cPHulk log files matched",
+            description=(
+                "No `/var/log/cphulkd.log*` files were found. "
+                "Either cPHulk is disabled on this host, or the "
+                "audit user cannot see the log."
+            ),
+            details={"scanned_paths": list(paths)},
+        ))
+        return findings
+
+    summary = agg.finalize()
+    findings.append(Finding(
+        module="cphulk_log",
+        severity=Severity.INFO,
+        title=(
+            f"Scanned {files_scanned} cphulkd.log file(s), "
+            f"{summary['classified_lines']} classified line(s)"
+        ),
+        description="cPHulk log scan complete.",
+        details={
+            "files_scanned": files_scanned,
+            "skipped_compressed": skipped_compressed,
+            **summary,
+        },
+    ))
+
+    findings.extend(rule_brute_force_by_ip(agg, settings))
+    findings.extend(rule_brute_force_by_user(agg, settings))
+    findings.extend(rule_block_summary(agg))
+
+    return findings

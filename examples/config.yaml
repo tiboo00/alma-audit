@@ -1,0 +1,112 @@
+# Sample configuration for alma-audit.
+#
+# All keys are optional — built-in defaults already point at
+# /var/log/apache2 + /var/log/apache2/domlogs. Use this file to:
+#   * point the toolkit at a non-standard log root,
+#   * tune rule thresholds,
+#   * enable/disable individual analyzers.
+
+paths:
+  apache_root: /var/log/apache2
+  domlog_root: /var/log/apache2/domlogs
+  # Glob patterns (one basename per entry). The analyzer globs the
+  # apache_root against each pattern.
+  access_log_glob:
+    - "access_log"
+    - "access_log.*"
+  error_log_glob:
+    - "error_log"
+    - "error_log.*"
+  modsec_log_glob:
+    - "modsec_audit*"
+
+  # Quick-win analyzers (GAPS §4 / AISO-186). Each root is a directory;
+  # the matching glob expands under that directory.
+  secure_log_root: /var/log
+  secure_log_glob:
+    - "secure"
+    - "secure.*"
+    - "secure-*"
+  auth_log_glob:
+    - "auth.log"
+    - "auth.log.*"
+    - "auth.log-*"
+  cphulk_log_root: /var/log
+  cphulk_log_glob:
+    - "cphulkd.log"
+    - "cphulkd.log.*"
+    - "cphulkd.log-*"
+  ssl_cert_roots:
+    - /var/cpanel/ssl
+    - /etc/pki/tls/certs
+    - /etc/ssl/certs
+  ssl_cert_glob:
+    - "*.pem"
+    - "*.crt"
+    - "*.cert"
+  csf_deny_paths:
+    - /etc/csf/csf.deny
+  csf_allow_paths:
+    - /etc/csf/csf.allow
+
+modules:
+  access_log:
+    top_host_share_warn: 0.30
+    top_host_share_crit: 0.70
+    error_rate_warn: 0.05
+    error_rate_crit: 0.20
+    probe_count_warn: 10
+    probe_count_crit: 100
+    weird_method_count_warn: 5
+    max_files_scanned: 50
+    # Per-file line cap. 0 = no cap. Default: 200,000.
+    max_lines_per_file: 200000
+
+  domlog_inventory:
+    max_entries: 1000
+    max_subdir_depth: 0
+
+  modsec_log:
+    error_5xx_warn: 5
+    error_5xx_crit: 50
+    modsec_deny_warn: 1
+    modsec_deny_crit: 50
+    max_files: 20
+    max_lines_per_file: 200000
+
+  # --- AISO-186 quick-win analyzers ---
+
+  secure_log:
+    # SSH brute-force burst from a single IP.
+    ssh_fail_warn: 5
+    ssh_fail_crit: 20
+    # sudo authentication failure burst from a single user.
+    sudo_fail_warn: 3
+    sudo_fail_crit: 10
+    # Disable to skip the UID=0 useradd CRITICAL rule entirely.
+    new_root_account_enabled: true
+    max_files: 20
+    max_lines_per_file: 200000
+
+  cphulk_log:
+    brute_force_warn: 5
+    brute_force_crit: 20
+    brute_force_user_warn: 5
+    brute_force_user_crit: 20
+    max_files: 10
+    max_lines_per_file: 200000
+
+  ssl_cert:
+    # Certs expiring within warn days → WARN; within crit → CRITICAL.
+    expiry_warn_days: 14
+    expiry_crit_days: 3
+    max_files: 200
+
+  csf_state:
+    deny_count_warn: 200
+    deny_count_crit: 2000
+    # Trend baseline. Set to an integer to enable the growth / shrinkage
+    # findings; leave null (or omit) to skip them.
+    deny_baseline: null
+    deny_growth_warn: 100
+    deny_growth_crit: 500

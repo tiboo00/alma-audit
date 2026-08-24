@@ -1,0 +1,29 @@
+[Unit]
+Description=alma-audit — read-only log audit for AlmaLinux WHMCS/cPanel hosts
+Documentation=https://example.invalid/alma-audit
+# We require the network to be online for hostname resolution, but not
+# for the actual scan (it reads local files). After= is just hygiene.
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+# Read-only by contract. Defense-in-depth:
+ReadOnlyPaths=/var/log/apache2 /var/log/apache2/domlogs
+ReadWritePaths=/var/log/alma-audit
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+# The toolkit never spawns subprocesses; lock it down anyway:
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+# Run the scan and write both reports:
+ExecStart=/usr/local/bin/alma-audit --output /var/log/alma-audit
+# Allow 10 minutes — ModSecurity scans can be slow on busy hosts.
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal

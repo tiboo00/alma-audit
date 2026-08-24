@@ -1,0 +1,43 @@
+# AISO-125 — AlmaLinux 8 + Python 3.11 smoke image.
+#
+# Mirrors the Stage 2 reproduction: the audit is installed system-wide
+# under the almalinux:8 base, and a `nobody` user exists so we can
+# reproduce a chmod-000 domlog_root as a non-root service account.
+#
+# Build:
+#   docker build -t alma-audit-smoke:al8-py311-AISO125 -f tests/Dockerfile.smoke .
+#
+# Run:
+#   docker run --rm --network=none alma-audit-smoke:al8-py311-AISO125
+#
+# The entrypoint runs the chmod-000 / runuser -u nobody test and
+# exits 0 on success, 1 on failure.
+
+FROM almalinux:8
+
+ARG PYTHON_VERSION=3.11
+
+RUN dnf install -y --setopt=tsflags=nodocs \
+        python${PYTHON_VERSION} python${PYTHON_VERSION}-pip \
+        python${PYTHON_VERSION}-devel gcc \
+    && dnf clean all \
+    && alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
+    && python3 -m pip install --quiet --upgrade pip
+
+# nobody exists on almalinux:8 by default; nothing to add.
+
+WORKDIR /opt/alma-audit
+
+# Install the package from this repo. We copy src/ and pyproject.toml
+# to keep the build deterministic without needing a git tag.
+COPY pyproject.toml /opt/alma-audit/
+COPY src /opt/alma-audit/src
+COPY tests /opt/alma-audit/tests
+
+# Editable install so `python -m alma_audit.cli` resolves to the in-tree code.
+RUN python3 -m pip install --quiet -e .
+
+COPY tests/smoke_entrypoint.sh /opt/alma-audit/smoke_entrypoint.sh
+RUN chmod +x /opt/alma-audit/smoke_entrypoint.sh
+
+ENTRYPOINT ["/opt/alma-audit/smoke_entrypoint.sh"]
