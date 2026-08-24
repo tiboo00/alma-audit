@@ -33,8 +33,14 @@ SEVERITY_EMOJI: dict[Severity, str] = {
 # Showing both would duplicate the operator-eye view. The
 # path-by-path breakdown lives in `alma-audit-forensic.json` for
 # forensic consumers.
+#
+# AISO-208: `top_path_ip_ua` is included (path × IP × UA combinations).
+# Rendering for this field is handled by a custom branch in
+# `_render_details_summary` because the row shape is `{path, ip,
+# user_agent, count}` — different from the default `{ip, count}`.
 _FORENSIC_FIELDS: tuple[str, ...] = (
     "top_attackers",
+    "top_path_ip_ua",
     "host_errors_top",
     "ssh_fail_details",
     "sudo_fail_details",
@@ -249,6 +255,16 @@ def _render_details_summary(lines: list[str], details: dict) -> None:
         if k in ("ssh_fail_by_ip", "ssh_invalid_user_by_ip"):
             continue
         if k in forensic_keys:
+            # AISO-208: `top_path_ip_ua` rows carry `{path, ip,
+            # user_agent, count}`. The default forensic-keys loop
+            # renders rows as `ip × count — last_seen`, which loses
+            # the path and UA — the two pieces the operator needs to
+            # distinguish "scanner using python-requests on /.env"
+            # from "credential stuffing on /wp-login.php via curl".
+            # Render these rows specially below; suppress the default
+            # rendering so we don't print them twice.
+            if k == "top_path_ip_ua":
+                continue
             forensic_subsections.append(f"- **{k}** (top 10 — full list in `alma-audit-forensic.json`):")
             total_field = f"_{k}_total"
             if total_field in details:
@@ -321,6 +337,37 @@ def _render_details_summary(lines: list[str], details: dict) -> None:
             forensic_subsections.append(
                 f"  - _The two patterns came from disjoint IP sets "
                 f"({len(combined_ips)} IP(s) total)._"
+            )
+
+    # AISO-208: emit the path × IP × UA section. Same rendering
+    # budget (top 10) as the other forensic fields, but the row
+    # format is richer — the operator needs to see all three
+    # dimensions (path, IP, UA) inline to tell apart different
+    # threat classes (e.g. python-requests on /.env vs curl on
+    # /wp-login.php). We render the rows as
+    # `/path` from `1.2.3.4` using `python-requests/2.28.0` × N —
+    # matching the example in the AISO-208 acceptance criteria.
+    top_path_ip_ua = details.get("top_path_ip_ua") or []
+    if isinstance(top_path_ip_ua, list) and top_path_ip_ua:
+        forensic_subsections.append(
+            "- **top_path_ip_ua** (top 10 — full list in "
+            "`alma-audit-forensic.json`): path × IP × user-agent "
+            "combinations:"
+        )
+        total_field = "_top_path_ip_ua_total"
+        if total_field in details:
+            forensic_subsections.append(
+                f"  - _Showing 10 of {details[total_field]} combinations._"
+            )
+        for row in top_path_ip_ua[:10]:
+            if not isinstance(row, dict):
+                continue
+            path = row.get("path", "?")
+            ip = row.get("ip", "?")
+            ua = row.get("user_agent", "<unknown>")
+            count = row.get("count", 0)
+            forensic_subsections.append(
+                f"  - `{path}` from `{ip}` using `{ua}` × {count}"
             )
 
     if forensic_subsections:
