@@ -52,17 +52,45 @@ _DOMLOG_FILE_RE = re.compile(r"^(?P<domain>[A-Za-z0-9.\-]+)(?:-(?P<suffix>ssl_lo
 # Shell metacharacters that should NEVER appear in a domlog filename.
 SHELL_METACHARS = set(";|&$`<>(){}[]!?\"'\\")
 
-# Filenames longer than this are suspicious. Real domains (e.g. very long
-# TLD chains) rarely exceed 60 chars; anything past 80 is almost always
-# junk.
-LENGTH_WARN = 60
-LENGTH_CRIT = 120
+# Default rule thresholds (AISO-207). Operators override these via the
+# YAML config (`modules.domlog_inventory.*`). The single source of
+# truth lives here so a `grep DEFAULT_RULES` finds every threshold in
+# one place.
+DEFAULT_RULES: dict[str, Any] = {
+    # Filename length heuristics. The §4.5 corpus long names are at most
+    # ~70 chars; anything past 60 is unusual on a real cPanel host.
+    "length_warn": 60,
+    "length_crit": 120,
+    # Repeated-character fuzzing artifact: a single char >=80% of the
+    # name AND name length >=20. Lowering either threshold catches
+    # shorter fuzz names.
+    "repeat_min_len": 20,
+    "repeat_ratio": 0.8,
+    # Discovery-layer caps (AISO-198). See analyze_domlog_inventory
+    # below for the rationale.
+    "max_entries": 1000,
+    # Walk one level deep so we descend into cPanel account-ID
+    # sub-directories (`<root>/<account>/<domain>`). Override via YAML
+    # if your layout nests deeper.
+    "max_subdir_depth": 1,
+    "max_files": 10000,  # cap across the whole walk to bound the scan
+}
+
+
+# Backwards-compat aliases — existing callers (and downstream tooling
+# that imports these as named constants) keep working. The analyzer
+# itself now reads from `DEFAULT_RULES`; the constants below are
+# derived so a `grep LENGTH_WARN` still surfaces them.
+LENGTH_WARN = DEFAULT_RULES["length_warn"]
+LENGTH_CRIT = DEFAULT_RULES["length_crit"]
+REPEAT_MIN_LEN = DEFAULT_RULES["repeat_min_len"]
+REPEAT_RATIO = DEFAULT_RULES["repeat_ratio"]
+
 
 # A filename made entirely of repeated single characters ("AAAAAAA...")
 # is a classic fuzzing artifact. We flag names where one character is
-# >= 80% of the length AND the length is at least 20.
-REPEAT_MIN_LEN = 20
-REPEAT_RATIO = 0.8
+# >= 80% of the length AND the length is at least 20. The actual
+# threshold pair is read from `settings` at analyze time (AISO-207).
 
 
 # ---------------------------------------------------------------------------
@@ -211,25 +239,38 @@ def _matches_contract_pattern(name: str) -> bool:
     return bool(DOMLOG_BAD_NAME.match(_normalise_for_d7(name)))
 
 
-def _is_anomalous_filename(name: str) -> dict[str, Any] | None:
+def _is_anomalous_filename(
+    name: str,
+    *,
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Return a reason dict if the domlog filename is anomalous, else None.
 
     Combines length/metachar/repeat heuristics with the §4.5.2 regex.
+    All four numeric thresholds come from `settings` (AISO-207) —
+    callers that pass `None` get the module-level defaults via
+    `DEFAULT_RULES`.
     """
-    if len(name) >= LENGTH_CRIT:
-        return {"reason": "filename_too_long", "length": len(name), "threshold": LENGTH_CRIT}
-    if len(name) >= LENGTH_WARN:
-        return {"reason": "filename_unusually_long", "length": len(name), "threshold": LENGTH_WARN}
+    cfg = settings if settings is not None else DEFAULT_RULES
+    length_warn = int(cfg["length_warn"])
+    length_crit = int(cfg["length_crit"])
+    repeat_min_len = int(cfg["repeat_min_len"])
+    repeat_ratio = float(cfg["repeat_ratio"])
+
+    if len(name) >= length_crit:
+        return {"reason": "filename_too_long", "length": len(name), "threshold": length_crit}
+    if len(name) >= length_warn:
+        return {"reason": "filename_unusually_long", "length": len(name), "threshold": length_warn}
 
     bad_chars = sorted({c for c in name if c in SHELL_METACHARS})
     if bad_chars:
         return {"reason": "shell_metacharacters", "chars": bad_chars}
 
     # repeated-character fuzzing pattern
-    if len(name) >= REPEAT_MIN_LEN:
+    if len(name) >= repeat_min_len:
         from collections import Counter
         most_common_char, char_count = Counter(name).most_common(1)[0]
-        if char_count / len(name) >= REPEAT_RATIO:
+        if char_count / len(name) >= repeat_ratio:
             return {
                 "reason": "repeated_character_pattern",
                 "char": most_common_char,
@@ -302,7 +343,7 @@ def _walk_and_classify(
             if files_visited >= max_files_total:
                 return
             files_visited += 1
-            reason = _is_anomalous_filename(name)
+            reason = _is_anomalous_filename(name, settings=settings)
             if reason is not None:
                 all_anomalies.append({
                     "filename": name,
@@ -343,12 +384,7 @@ def analyze_domlog_inventory(
     via `modules.domlog_inventory.max_subdir_depth` in YAML.
     """
     settings = {
-        "max_entries": 1000,
-        # AISO-198: walk one level deep so we descend into cPanel
-        # account-ID sub-directories (`<root>/<account>/<domain>`).
-        # Override via YAML if your layout nests deeper.
-        "max_subdir_depth": 1,
-        "max_files": 10000,  # cap across the whole walk to bound the scan
+        **DEFAULT_RULES,
         **(rules or {}),
     }
     max_depth = max(0, int(settings.get("max_subdir_depth", 1)))

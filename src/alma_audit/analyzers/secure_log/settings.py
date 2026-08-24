@@ -15,6 +15,13 @@ DEFAULT_RULES: dict[str, Any] = {
     # SSH brute-force burst from a single source.
     "ssh_fail_warn": 5,        # >= 5 failed passwords in window → WARN
     "ssh_fail_crit": 20,       # >= 20 → CRITICAL
+    # AISO-203: separate threshold pair for username enumeration
+    # (`Invalid user X from <ip>`). Operators with a known scanner
+    # landscape (masscan / research / a friendly bot) raise this bar
+    # so the per-IP brute-force rule doesn't page on a normal
+    # username-enumeration pass. Defaults mirror the ssh_fail pair.
+    "ssh_invalid_user_warn": 5,
+    "ssh_invalid_user_crit": 20,
     # sudo authentication failure burst from a single user.
     "sudo_fail_warn": 3,
     "sudo_fail_crit": 10,

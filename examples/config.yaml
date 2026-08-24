@@ -68,10 +68,30 @@ modules:
     max_files_scanned: 50
     # Per-file line cap. 0 = no cap. Default: 200,000.
     max_lines_per_file: 200000
+    # AISO-204: bandwidth anomaly detection. The rule applies only
+    # when the access_log holds at least `bandwidth_hog_min_lines`
+    # rows (default 1000) — on a tiny log a single host is
+    # mechanically dominant. `bandwidth_hog_warn` / `_crit` are the
+    # share-of-total-bytes thresholds that gate WARN / CRITICAL.
+    bandwidth_hog_min_lines: 1000
+    bandwidth_hog_warn: 0.50
+    bandwidth_hog_crit: 0.80
 
   domlog_inventory:
     max_entries: 1000
-    max_subdir_depth: 0
+    max_subdir_depth: 1
+    max_files: 10000
+    # AISO-207: filename length heuristics. Real domains rarely
+    # exceed 60 chars; anything past 120 is almost always a fuzz
+    # artifact. Override to relax/tighten the WARN / CRITICAL bars.
+    length_warn: 60
+    length_crit: 120
+    # AISO-207: repeated-character fuzzing detector. A single char
+    # >= `repeat_ratio` of the name AND name length >= `repeat_min_len`
+    # trips `repeated_character_pattern`. Lower `repeat_min_len` to
+    # catch shorter fuzz names.
+    repeat_min_len: 20
+    repeat_ratio: 0.8
 
   modsec_log:
     error_5xx_warn: 5
@@ -80,13 +100,24 @@ modules:
     modsec_deny_crit: 50
     max_files: 20
     max_lines_per_file: 200000
+    # AISO-207: how many severity=CRITICAL rule hits must accumulate
+    # before the analyzer escalates to a CRITICAL finding. Default 1
+    # preserves the historical "any single CRITICAL match fires"
+    # behaviour; raise this on noisy test hosts.
+    critical_hit_count: 1
 
   # --- AISO-186 quick-win analyzers ---
 
   secure_log:
-    # SSH brute-force burst from a single IP.
+    # SSH brute-force burst from a single IP (combined
+    # credential-stuffing + username-enumeration total).
     ssh_fail_warn: 5
     ssh_fail_crit: 20
+    # AISO-207: separate threshold pair for username enumeration
+    # (`Invalid user X from <ip>`). Defaults mirror the ssh_fail pair
+    # above; raise to suppress pages on a known scanner landscape.
+    ssh_invalid_user_warn: 5
+    ssh_invalid_user_crit: 20
     # sudo authentication failure burst from a single user.
     sudo_fail_warn: 3
     sudo_fail_crit: 10

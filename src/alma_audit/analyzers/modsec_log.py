@@ -303,12 +303,27 @@ def analyze_modsec_and_errors(
     fs: FileSystem,
     rules: dict[str, Any] | None = None,
 ) -> list[Finding]:
-    """Scan error_log(s) and ModSecurity audit log(s)."""
+    """Scan error_log(s) and ModSecurity audit log(s).
+
+    Threshold knobs (AISO-207 — every value is overridable via the
+    YAML config `modules.modsec_log.*`):
+
+      * `error_5xx_warn` / `error_5xx_crit` — Apache error_log 5xx count
+        per scan window.
+      * `modsec_deny_warn` / `modsec_deny_crit` — ModSecurity deny /
+        drop / block / intercepted action count per scan window.
+      * `critical_hit_count` — how many severity=CRITICAL rule hits
+        must accumulate before the analyzer escalates to a CRITICAL
+        finding. Default 1 (any single CRITICAL match fires). Raise
+        this on noisy test environments.
+      * `max_files` / `max_lines_per_file` — defensive caps.
+    """
     settings = {
         "error_5xx_warn": 5,
         "error_5xx_crit": 50,
         "modsec_deny_warn": 1,    # any deny in a windowed sample is a signal
         "modsec_deny_crit": 50,
+        "critical_hit_count": 1,  # AISO-207: raise to suppress 1-off noise
         "max_files": 20,
         "max_lines_per_file": 200_000,
         **(rules or {}),
@@ -447,14 +462,21 @@ def analyze_modsec_and_errors(
             },
             recommendation="Cross-reference with access_log IPs; consider fail2ban.",
         ))
-    if agg.max_severity >= 2:
+    # AISO-207: the escalation threshold was previously a hardcoded
+    # `agg.max_severity >= 2` (i.e. "any single severity=CRITICAL hit
+    # fires"). Operators on noisy test hosts now raise the bar via
+    # `modules.modsec_log.critical_hit_count`. Default is 1 — the
+    # historical behaviour is preserved when no override is set.
+    if len(agg.critical_hits) >= int(settings["critical_hit_count"]):
         findings.append(Finding(
             module="modsec_log",
             severity=Severity.CRITICAL,
             title="ModSecurity CRITICAL severity rule fired",
             description=(
-                "At least one matched rule reported severity=CRITICAL. This "
-                "indicates an active exploit attempt, not just probing."
+                f"{len(agg.critical_hits)} matched rule(s) reported "
+                "severity=CRITICAL (threshold "
+                f"{settings['critical_hit_count']}). This indicates an "
+                "active exploit attempt, not just probing."
             ),
             details={"critical_hits": agg.critical_hits[:10]},
             recommendation="Investigate the source IP and rule ID immediately.",
