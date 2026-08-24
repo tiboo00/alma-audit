@@ -298,7 +298,6 @@ def render_markdown(report: TrendReport) -> str:
     lines.append("| Severity | Previous | Current | Δ |")
     lines.append("|----------|---------:|--------:|--:|")
     for sev in ("info", "warn", "critical", "total"):
-        prev = report.previous_summary.get(sev) or report.previous_summary.get(sev.title() + "_findings" if False else sev, 0)
         if sev == "total":
             prev = report.previous_summary.get("total_findings", 0)
             curr = report.current_summary.get("total_findings", 0)

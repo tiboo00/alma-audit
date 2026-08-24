@@ -312,21 +312,21 @@ but always "what new file does this belong in".
 | `analyzers/secure_log/aggregator.py` | 104 | 🟢 ok | streaming counters |
 | `analyzers/secure_log/rules.py` | 197 | 🟢 ok | D8/D9/D10/D11 rules |
 | `analyzers/secure_log/settings.py` | 51 | 🟢 ok | thresholds + globs |
-| `analyzers/secure_log/analyzer.py` | 124 | 🟢 ok | orchestrator |
+| `analyzers/secure_log/analyzer.py` | 199 | 🟢 ok | orchestrator |
 | `analyzers/secure_log/__init__.py` | 45 | 🟢 ok | re-exports |
 | `analyzers/ssl_cert/parser.py` | 106 | 🟢 ok | X.509 PEM parser, optional `[ssl]` extra |
 | `analyzers/ssl_cert/aggregator.py` | 47 | 🟢 ok | thin aggregator |
 | `analyzers/ssl_cert/rules.py` | 123 | 🟢 ok | D12/D13 expiry + read-error rules |
 | `analyzers/ssl_cert/settings.py` | 34 | 🟢 ok | thresholds + cert roots |
-| `analyzers/ssl_cert/analyzer.py` | 202 | 🟢 ok | orchestrator |
+| `analyzers/ssl_cert/analyzer.py` | 255 | 🟢 ok | orchestrator |
 | `analyzers/ssl_cert/__init__.py` | 45 | 🟢 ok | re-exports |
 | `analyzers/cphulk_log/parser.py` | 123 | 🟢 ok | cPHulk syslog parser |
 | `analyzers/cphulk_log/aggregator.py` | 76 | 🟢 ok | per-IP + per-user counters |
 | `analyzers/cphulk_log/rules.py` | 146 | 🟢 ok | D14/D15/D16 rules |
 | `analyzers/cphulk_log/settings.py` | 41 | 🟢 ok | thresholds + globs |
-| `analyzers/cphulk_log/analyzer.py` | 96 | 🟢 ok | orchestrator |
+| `analyzers/cphulk_log/analyzer.py` | 168 | 🟢 ok | orchestrator |
 | `analyzers/cphulk_log/__init__.py` | 46 | 🟢 ok | re-exports |
-| `analyzers/csf_state.py` | 280 | 🟢 ok | single-purpose flat module (AISO-186) |
+| `analyzers/csf_state.py` | 376 | 🟢 ok | single-purpose flat module (AISO-186) |
 | `runners.py` | 284 | 🟢 ok | single responsibility (file-glob runner + injected FS + read_bytes) |
 | `runner.py` | 239 | 🟢 ok | orchestration only; no detection logic |
 | `cli.py` | 134 | 🟢 ok | argparse + entry; nothing to split |
