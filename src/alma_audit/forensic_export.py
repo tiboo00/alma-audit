@@ -319,6 +319,15 @@ def build_forensic_export(
     ssh_fail_by_ip: list[dict[str, Any]] = []
     probe_paths_by_ip: dict[str, list[dict[str, Any]]] = {}
 
+    # AISO-206: the domlog inventory finding carries its full
+    # `details.anomalies` payload already sorted by `_SORT_WEIGHTS`
+    # (most-dangerous first, then filename ascending). We expose it
+    # verbatim under an explicit `domlog_anomalies` key on the
+    # forensic export so the operator sees the weighted ordering in
+    # `alma-audit-forensic.json`, not only in `alma-audit-latest.json`.
+    # AC #4 — the forensic JSON preserves the sort.
+    domlog_anomalies: list[dict[str, Any]] = []
+
     # Also expose raw rule lists for direct ingestion.
     cloudflare_payloads: list[dict[str, Any]] = []
     cloudflare_curl_script: str = ""
@@ -366,6 +375,19 @@ def build_forensic_export(
                 "first_seen": row.get("first_seen"),
                 "last_seen": row.get("last_seen"),
             })
+        # AISO-206: collect the domlog `details.anomalies` payload
+        # verbatim. The analyzer (`domlog_inventory.analyze_domlog_inventory`)
+        # is the single source of truth for the sorted ordering —
+        # `_SORT_WEIGHTS` (most-dangerous first, filename ascending
+        # within the same weight). We don't re-sort here; we only carry
+        # the already-sorted list into the forensic export. Multiple
+        # findings with anomalies (e.g. two domlog roots) are merged in
+        # the order their findings are passed in, which is deterministic
+        # because the orchestrator (`runner.run_analyzers`) walks the
+        # domlog roots in a stable order. Defensive copy via `list(...)`
+        # so a downstream consumer can't mutate the Finding's payload.
+        if isinstance(details.get("anomalies"), list):
+            domlog_anomalies.extend(list(details["anomalies"]))
 
     # Build Cloudflare payloads + curl script (after collection).
     cloudflare_payloads = build_cloudflare_block_payloads(findings)
@@ -384,6 +406,7 @@ def build_forensic_export(
                 r.get("total_probe_requests", 0) or 0 for r in scanner_ips
             ),
             "ssh_fail_count_total": sum(r.get("count", 0) or 0 for r in ssh_fail_by_ip),
+            "domlog_anomalies_total": len(domlog_anomalies),
         },
         "scanner_ips": scanner_ips,
         "brute_force_ips": brute_force_ips,
@@ -391,6 +414,12 @@ def build_forensic_export(
         "sudo_fail_users": sudo_fail_users,
         "ssh_fail_by_ip": ssh_fail_by_ip,
         "probe_paths_by_ip": probe_paths_by_ip,
+        # AISO-206: explicit, full, already-sorted domlog anomalies.
+        # The forensic JSON (`alma-audit-forensic.json`) keeps this
+        # list intact so the operator can see the weighted ordering
+        # here too, not only in `alma-audit-latest.json`. Empty list
+        # is the correct sentinel when no domlog finding surfaced.
+        "domlog_anomalies": domlog_anomalies,
         "cloudflare": {
             "payloads": cloudflare_payloads,
             "curl_script": cloudflare_curl_script,

@@ -416,20 +416,40 @@ def test_aiso206_full_report_and_forensic_share_sorted_anomalies():
 
     We build a real `AuditReport` via `cli.main()`'s report path (the
     same code that emits `alma-audit-latest.json` and the forensic
-    JSON), then assert that both artifacts' `details["anomalies"]`
-    come out in the weighted order.
+    JSON), then assert:
+
+      1. `alma-audit-latest.json` carries the sorted `details.anomalies`
+         payload on the domlog-anomalies finding.
+      2. `alma-audit-forensic.json` carries the SAME list verbatim
+         under the explicit top-level `domlog_anomalies` key (AISO-206
+         follow-up — the field MUST exist, even when empty).
+      3. The order in (2) is identical to (1), including the
+         alphabetical tie-breaker for entries that share the same
+         `_SORT_WEIGHTS` reason.
+
+    The fixture is deliberately asymmetric: two `filename_too_long`
+    filenames whose first character differs (`x` vs `y`) so the
+    alphabetical secondary sort is observable. The pure-x / pure-y
+    strings both trip `_is_anomalous_filename`'s length-CRIT branch
+    (weight 50) BEFORE the repeated-character branch — so they stay
+    on the same weight tier. The expected order is `'x' * 130` < `'y' * 130`
+    (filename ascending).
     """
     from alma_audit.reporting import build_report, write_forensic_report
 
-    # 4 filenames so we exercise multiple weight tiers + a tie.
-    # - `host;rm` → shell_metacharacters (weight 100, top)
-    # - `hostnAAAA...` (length 25, all-A) → repeated_character_pattern (70)
-    # - 2 × "x" * 130 → filename_too_long (50, alphabetical tie)
+    # 4 filenames exercising:
+    # - shell_metacharacters (weight 100) — top of the sorted list
+    # - repeated_character_pattern (weight 70) — `A` * 25 hits the
+    #   REPEAT_MIN_LEN=20 / REPEAT_RATIO=0.8 branch (no length-CRIT trip
+    #   because length is 25 < LENGTH_CRIT=120).
+    # - 2 × filename_too_long (weight 50) — pure-x and pure-y strings
+    #   of length 130 both trip the LENGTH_CRIT branch first; the
+    #   secondary alphabetical sort puts `x...` before `y...`.
     filenames = [
-        "x" * 130,                  # filename_too_long
-        "host;rm",                  # shell_metacharacters
+        "x" * 130,                  # filename_too_long (a-run, alphabetical tie 1/2)
+        "host;rm",                  # shell_metacharacters (top)
         "A" * 25,                   # repeated_character_pattern
-        "y" * 130,                  # filename_too_long (alphabetical tie with first)
+        "y" * 130,                  # filename_too_long (b-run, alphabetical tie 2/2)
     ]
     # Re-run the analyzer to grab the actual Finding objects.
     files = {f"{DOMLOG_ROOT}/{name}": "log" for name in filenames}
@@ -442,41 +462,79 @@ def test_aiso206_full_report_and_forensic_share_sorted_anomalies():
         if "anomalous domlog filename" in f["title"].lower()
     )
     latest_anomalies = latest_agg["details"]["anomalies"]
-    # The expected top entry is the shell-metacharacter filename.
-    assert latest_anomalies[0]["reason"] == "shell_metacharacters"
-    assert latest_anomalies[0]["filename"] == "host;rm"
-    # The fuzzing pattern comes next.
-    assert latest_anomalies[1]["reason"] == "repeated_character_pattern"
-    # The two filename_too_long entries tie on weight (50); the secondary
-    # sort is ascending alphabetical on filename, so the two pure-x
-    # runs are tied (no tie-breaker beyond equality) — accept either
-    # order for the tie case, but the third entry from the top must be
-    # a filename_too_long.
-    assert latest_anomalies[2]["reason"] == "filename_too_long"
+    # Pin the full sorted order on the latest report. The exact
+    # sequence is part of the AC #4 contract:
+    #   [shell_metacharacters, repeated_character_pattern,
+    #    filename_too_long (x...), filename_too_long (y...)]
+    assert [a["reason"] for a in latest_anomalies] == [
+        "shell_metacharacters",
+        "repeated_character_pattern",
+        "filename_too_long",
+        "filename_too_long",
+    ], (
+        f"alma-audit-latest.json drift: {[a['reason'] for a in latest_anomalies]}"
+    )
+    assert [a["filename"] for a in latest_anomalies] == [
+        "host;rm",
+        "A" * 25,
+        "x" * 130,        # filename ascending — `x` < `y`
+        "y" * 130,
+    ], (
+        f"alma-audit-latest.json filename-order drift: "
+        f"{[a['filename'] for a in latest_anomalies]}"
+    )
 
-    # --- alma-audit-forensic.json shares the same payload ---
+    # --- alma-audit-forensic.json carries the same payload under `domlog_anomalies` ---
     import tempfile
     import json as _json
     with tempfile.TemporaryDirectory() as tmp:
         path = write_forensic_report(build_report(findings, hostname="test-host"), tmp)
         with open(path, encoding="utf-8") as fh:
             forensic = _json.load(fh)
-    # The forensic JSON keeps the full findings list (AISO-199 — per-IP
-    # detail is the *additional* split, not a replacement). The domlog
-    # anomaly finding lives there too, with the same details.anomalies.
-    forensic_agg = next(
-        (f for f in forensic.get("findings", [])
-         if "anomalous domlog filename" in f.get("title", "").lower()),
-        None,
+
+    # AC #4 follow-up: the forensic JSON MUST expose `domlog_anomalies`
+    # as a top-level field (not buried inside an `if findings`
+    # collection). The supervisor caught that the previous
+    # `if forensic_agg is not None` guard silently swallowed the
+    # AC #4 assertion when the field was missing.
+    assert "domlog_anomalies" in forensic, (
+        f"alma-audit-forensic.json missing the explicit `domlog_anomalies` "
+        f"field — top-level keys present: {sorted(forensic.keys())}"
     )
-    if forensic_agg is not None:
-        # If forensic keeps findings, the sort order MUST match.
-        forensic_reasons = [a["reason"] for a in forensic_agg["details"]["anomalies"]]
-        latest_reasons = [a["reason"] for a in latest_anomalies]
-        assert forensic_reasons == latest_reasons, (
-            f"forensic JSON drifted from alma-audit-latest.json: "
-            f"{forensic_reasons} vs {latest_reasons}"
-        )
-    # Either way, the full report (`alma-audit-latest.json`) preserves
-    # the sort — that is the operator-facing artifact for the domlog
-    # inventory.
+    # Summary counter must agree with the list length.
+    assert forensic.get("summary", {}).get("domlog_anomalies_total") == len(filenames), (
+        f"summary.domlog_anomalies_total drifted from list length: "
+        f"{forensic.get('summary', {}).get('domlog_anomalies_total')} vs {len(filenames)}"
+    )
+    forensic_anomalies = forensic["domlog_anomalies"]
+    assert isinstance(forensic_anomalies, list), (
+        f"`domlog_anomalies` must be a list, got {type(forensic_anomalies).__name__}"
+    )
+    # The full forensic list MUST match the latest report exactly,
+    # reason-by-reason and filename-by-filename — including the
+    # alphabetical tie-breaker for the two `filename_too_long` entries.
+    assert [a["reason"] for a in forensic_anomalies] == [
+        "shell_metacharacters",
+        "repeated_character_pattern",
+        "filename_too_long",
+        "filename_too_long",
+    ], (
+        f"alma-audit-forensic.json reason-order drift: "
+        f"{[a['reason'] for a in forensic_anomalies]}"
+    )
+    assert [a["filename"] for a in forensic_anomalies] == [
+        "host;rm",
+        "A" * 25,
+        "x" * 130,
+        "y" * 130,
+    ], (
+        f"alma-audit-forensic.json filename-order drift: "
+        f"{[a['filename'] for a in forensic_anomalies]}"
+    )
+    # Belt-and-braces: object-identity-equivalent payload (same items,
+    # same order, same contents). Dict equality compares values, so this
+    # also catches accidental re-sort or schema drift.
+    assert forensic_anomalies == latest_anomalies, (
+        "alma-audit-forensic.json `domlog_anomalies` drifted from "
+        "alma-audit-latest.json `details.anomalies`"
+    )
