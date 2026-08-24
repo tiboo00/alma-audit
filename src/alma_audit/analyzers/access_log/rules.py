@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+from ...fix_suggestions import attach_fixes, lookup_fixes
 from ...models import Finding, Severity
 from ..crawler_verify import CrawlerSuppression, Resolver
 from .aggregator import AccessAggregator, SAFE_METHODS
@@ -176,7 +177,7 @@ def rule_probe_paths(
         sev = None
     if sev is None:
         return []
-    return [Finding(
+    base = Finding(
         module="access_log",
         severity=sev,
         title=f"{probe_total} request(s) to known probe paths",
@@ -213,7 +214,11 @@ def rule_probe_paths(
             "Top offenders are listed in `top_attackers`; full per-path detail in "
             "`probe_paths_by_ip`."
         ),
-    )]
+    )
+    # AISO-210: structured fix library — .htaccess / Cloudflare WAF /
+    # fail2ban. The render layer groups by scope; the operator walks
+    # the cheapest fix first.
+    return [attach_fixes(base, lookup_fixes("D2:probe_hits"))]
 
 
 # AISO-208: cap on the path × IP × UA combination list. The forensic
@@ -321,7 +326,7 @@ def rule_weird_methods(
             weird_methods[method] += count
     if sum(weird_methods.values()) < settings["weird_method_count_warn"]:
         return []
-    return [Finding(
+    base = Finding(
         module="access_log",
         severity=Severity.WARN,
         title="Unusual HTTP methods observed",
@@ -334,7 +339,12 @@ def rule_weird_methods(
             "crawler_suppression": CrawlerSuppression.not_applicable().to_dict(),
         },
         recommendation="Inspect source IPs; consider blocking WebDAV methods if not used.",
-    )]
+    )
+    # AISO-210: four-scope fix set — Apache TraceEnable, .htaccess
+    # LimitExcept, Cloudflare WAF method block, ModSecurity rule.
+    # Each scope carries its own risk rating so the operator can pick
+    # the cheapest first.
+    return [attach_fixes(base, lookup_fixes("D5:weird_methods"))]
 
 
 def rule_bandwidth_hog(
