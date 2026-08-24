@@ -57,8 +57,15 @@ RUN dnf install -y \
 # nobody` invocations) can find the modules on `sys.path`.
 # We use symlinks rather than copying: smaller image, and the layer
 # below only needs to re-run when `pip install` changes.
+#
+# `wheel` is needed because pip 22+ invokes `bdist_wheel` for editable
+# installs by default; without it the entrypoint's
+# `pip install --editable /src` fails with `invalid command
+# 'bdist_wheel'`. Setuptools is also pinned >= 68 because setuptools
+# 68 removed `bdist_wheel` itself; combined with the bundled wheel
+# package, editable installs work offline (no PyPI round-trip).
 RUN python3.11 -m pip install --quiet --upgrade pip \
-    && python3.11 -m pip install --quiet pytest cryptography PyYAML \
+    && python3.11 -m pip install --quiet 'pytest>=7' 'cryptography>=42' 'PyYAML>=5.1' 'setuptools>=68' 'wheel' \
     && for src_dir in /usr/local/lib/python3.11/site-packages /usr/local/lib64/python3.11/site-packages; do \
          if [ -d "$src_dir" ]; then \
            for d in "$src_dir"/*; do \
