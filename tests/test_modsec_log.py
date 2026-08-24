@@ -183,18 +183,63 @@ def test_aggregator_modsec_rule_breakdown_units_by_count_then_rule_id():
     assert result["top_rule_ids"] == [("941100", 2), ("942100", 2)]
 
 
-def test_aggregator_modsec_rule_breakdown_uri_first_seen_wins():
-    """The first URI to fire a rule sticks (later hits for the same rule
-    do not overwrite it). Keeps the operator-facing value stable across
-    noisy repeat-scanner traffic.
+def test_aggregator_modsec_rule_breakdown_top_uri_picks_most_frequent():
+    """AISO-205 follow-up: top_uri is the URI that fired a rule the MOST
+    often, NOT the first URI seen.
+
+    The previous "first-URI-wins" implementation was flagged by the
+    Supervisor as semantically wrong: feeding `/rare-first` × 1 then
+    `/common` × 3 used to surface `/rare-first` even though `/common`
+    fired 3× as often. This test pins the corrected behaviour: the
+    most-frequent URI wins.
     """
     agg = ModSecAggregator()
-    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/first")
-    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/second")
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/rare-first")
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/common")
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/common")
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/common")
 
     result = agg.finalize()
 
-    assert result["modsec_rule_breakdown"] == [("942100", 2, "/first")]
+    # Rule 942100 fired 4 times — 1× /rare-first, 3× /common. /common
+    # is the top_uri, not the first-seen /rare-first.
+    assert result["modsec_rule_breakdown"] == [("942100", 4, "/common")]
+
+
+def test_aggregator_modsec_rule_breakdown_top_uri_lex_tie_break():
+    """When two URIs tie on count for the same rule, the lex-smallest URI
+    wins so the operator dashboard sees a deterministic value across runs.
+
+    ``Counter.most_common()`` is NOT stable for ties — it preserves
+    insertion order, which depends on parse order. We sort explicitly
+    by ``(-count, uri)`` to keep the result reproducible.
+    """
+    agg = ModSecAggregator()
+    # Insert /zzz first so insertion order would prefer it under
+    # ``Counter.most_common()`` — the tie-break must still prefer /aaa.
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/zzz")
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/aaa")
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/zzz")
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/aaa")
+
+    result = agg.finalize()
+
+    # /aaa and /zzz both fired 2×; lex tie-break prefers /aaa.
+    assert result["modsec_rule_breakdown"] == [("942100", 4, "/aaa")]
+
+
+def test_aggregator_modsec_rule_breakdown_empty_uri_when_parser_cannot_extract():
+    """If the parser never supplied a URI for a rule (malformed
+    B-section), top_uri falls back to an empty string rather than
+    surfacing a phantom bucket.
+    """
+    agg = ModSecAggregator()
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="")
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="")
+
+    result = agg.finalize()
+
+    assert result["modsec_rule_breakdown"] == [("942100", 2, "")]
 
 
 def test_aggregator_modsec_rule_breakdown_caps_at_top_10():
