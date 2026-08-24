@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 from . import __version__
@@ -81,6 +82,24 @@ def build_parser() -> argparse.ArgumentParser:
              "(default: ./alma-audit-out).",
     )
     parser.add_argument(
+        "--ssh-config",
+        default=None,
+        help="Path to the sshd_config file to audit "
+             "(default: /etc/ssh/sshd_config). Drop-ins under "
+             "/etc/ssh/sshd_config.d/*.conf are auto-included in "
+             "alphabetical order. AISO-209.",
+    )
+    parser.add_argument(
+        "--ssh-drop-in-dir",
+        default=None,
+        help="Directory of sshd_config drop-in files (*.conf). "
+             "Concatenated in alphabetical order, matching OpenSSH "
+             "``Include`` semantics. Defaults to "
+             "``<parent of --ssh-config>/sshd_config.d`` when "
+             "--ssh-config is set, otherwise "
+             "``/etc/ssh/sshd_config.d``. AISO-209.",
+    )
+    parser.add_argument(
         "--list-analyzers",
         action="store_true",
         help="Print the analyzer names this build provides and exit.",
@@ -107,6 +126,22 @@ def _apply_cli_overrides(cfg: Config, args: argparse.Namespace) -> Config:
         # When set, this overrides `domlog_root` at the analyzer layer
         # (the runner prefers a non-empty `domlog_roots`).
         cfg.paths.domlog_roots = list(args.domlog_roots)
+    if getattr(args, "ssh_config", None):
+        # AISO-209: override the sshd_config path used by the
+        # ssh_hardening analyzer. When the operator points
+        # ``--ssh-config`` at a custom location but does NOT also
+        # pass ``--ssh-drop-in-dir``, derive the drop-in directory
+        # as ``<parent of --ssh-config>/sshd_config.d`` to keep
+        # the default-OpenSSH layout (e.g. /test/cfg/sshd_config
+        # → /test/cfg/sshd_config.d). Operators can override with
+        # an explicit ``--ssh-drop-in-dir``.
+        cfg.paths.ssh_config_path = args.ssh_config
+        if getattr(args, "ssh_drop_in_dir", None) is None:
+            cfg.paths.ssh_drop_in_dir = (
+                os.path.join(os.path.dirname(args.ssh_config) or "/", "sshd_config.d")
+            )
+    if getattr(args, "ssh_drop_in_dir", None):
+        cfg.paths.ssh_drop_in_dir = args.ssh_drop_in_dir
     return cfg
 
 
@@ -125,10 +160,13 @@ def main(argv: list[str] | None = None) -> int:
         # access_log analyzer. We expose its name for introspection so
         # operators can grep for it in reports / cron output. The
         # quick-win analyzers (AISO-186 / GAPS §4) are listed in
-        # feature-add order.
+        # feature-add order. ``ssh_hardening`` (AISO-209) is the
+        # latest addition; it audits the SSH daemon's own config
+        # rather than its log output.
         for name in (
             "access_log", "domlog_inventory", "modsec_log", "crawler_verify",
             "secure_log", "ssl_cert", "cphulk_log", "csf_state",
+            "ssh_hardening",
         ):
             print(name)
         return 0

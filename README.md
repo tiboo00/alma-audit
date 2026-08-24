@@ -32,6 +32,7 @@ almalinux-whmcs-cpanel-security-audit/
 │       ├── secure_log/         # /var/log/secure + /var/log/auth.log
 │       ├── ssl_cert/           # X.509 cert expiry (opt-in `[ssl]` extra)
 │       ├── cphulk_log/         # cPHulk brute-force / block events
+│       ├── ssh_hardening/      # sshd_config + drop-ins audit (AISO-209)
 │       └── csf_state.py        # /etc/csf/csf.deny + csf.allow state
 ├── examples/
 │   ├── config.yaml             # sample config (read-only)
@@ -106,6 +107,18 @@ Built-in rules (see `src/alma_audit/analyzers/*.py` for thresholds):
   WARN/CRITICAL on denylist size above `deny_count_warn` /
   `deny_count_crit`; optional growth/shrinkage deltas against an
   operator-provided baseline.
+- **ssh_hardening** (AISO-209) — `/etc/ssh/sshd_config` (plus
+  `sshd_config.d/*.conf` drop-ins, concatenated in alphabetical
+  order to match OpenSSH `Include` semantics) audit. CRITICAL on
+  `PermitRootLogin yes`, `PermitEmptyPasswords yes`, or `Protocol
+  1` enabled; WARN on `PasswordAuthentication yes`, default port
+  22, `MaxAuthTries > 6`, `ClientAliveInterval 0`,
+  `LoginGraceTime > 120`, missing `AllowUsers` / `AllowGroups`,
+  and weak `Ciphers` / `MACs`; INFO on `X11Forwarding yes`,
+  `PermitRootLogin prohibit-password`, and missing `Banner`.
+  Override the path via `--ssh-config PATH` /
+  `--ssh-drop-in-dir DIR` (CLI) or
+  `paths.ssh_config_path` / `paths.ssh_drop_in_dir` (YAML).
 
 ## Trend sidecar
 

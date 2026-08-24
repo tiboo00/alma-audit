@@ -56,6 +56,13 @@ paths:
   csf_allow_paths:
     - /etc/csf/csf.allow
 
+  # AISO-209: SSH daemon config + drop-ins. Override either field
+  # to point at a non-standard location (e.g. for testing, or for
+  # hosts where sshd runs under a chroot). The CLI flag
+  # `--ssh-config PATH` overrides the main path only.
+  ssh_config_path: /etc/ssh/sshd_config
+  ssh_drop_in_dir: /etc/ssh/sshd_config.d
+
 modules:
   access_log:
     top_host_share_warn: 0.30
@@ -160,3 +167,17 @@ modules:
     deny_baseline: null
     deny_growth_warn: 100
     deny_growth_crit: 500
+
+  # AISO-209: SSH daemon hardening audit (sshd_config + drop-ins).
+  # The analyzer flags PermitRootLogin yes / Protocol 1 / empty
+  # passwords as CRITICAL; password auth, default port, large
+  # MaxAuthTries / LoginGraceTime, missing allowlist and weak
+  # Ciphers / MACs as WARN; X11Forwarding yes / no Banner /
+  # PermitRootLogin prohibit-password as INFO. Thresholds:
+  ssh_hardening:
+    # `MaxAuthTries` greater than this is a WARN.
+    # 6 matches the CIS Benchmark upper bound.
+    max_auth_tries_warn: 6
+    # `LoginGraceTime` (seconds) greater than this is a WARN.
+    # 120 matches the OpenSSH default + CIS Benchmark upper bound.
+    login_grace_time_warn: 120
