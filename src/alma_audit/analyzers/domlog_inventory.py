@@ -43,6 +43,7 @@ from typing import Any
 
 from ..models import Finding, Severity
 from ..runners import FileSystem
+from .domlog_roots import DEFAULT_DOMLOG_ROOTS, should_skip_filename
 
 # A "normal" domlog name: a domain, optionally followed by -ssl_log
 # or -bytes_log. Domain itself: letters/digits/dots/hyphens only.
@@ -222,126 +223,179 @@ def _is_anomalous_filename(name: str) -> dict[str, Any] | None:
 
 
 def analyze_domlog_inventory(
-    domlog_root: str,
+    domlog_roots: list[str] | None,
     fs: FileSystem,
     rules: dict[str, Any] | None = None,
 ) -> list[Finding]:
-    """Scan the domlog directory and emit findings for anomalies."""
+    """Scan one or more domlog directories and emit findings for anomalies.
+
+    `domlog_roots` is a list of directories to walk. Pass `None` to use
+    the default CloudLinux / cPanel layout
+    (`DEFAULT_DOMLOG_ROOTS` from `domlog_roots.py`). Each existing
+    root is scanned independently; findings from all roots are merged.
+
+    Filenames ending in `-bytes_log`, `-bytes_log.bkup`, or `.offset`
+    are skipped at the discovery layer — see `domlog_roots.py` for the
+    rationale (mod_log_config byte-counters and cPanel offset backups
+    are not Apache combined-format logs).
+    """
     settings = {
         "max_entries": 1000,
         "max_subdir_depth": 0,  # domlogs should be flat — subdirs are suspect
         **(rules or {}),
     }
+    roots = list(domlog_roots) if domlog_roots is not None else list(DEFAULT_DOMLOG_ROOTS)
+
     findings: list[Finding] = []
 
-    if not fs.is_dir(domlog_root):
+    # Aggregated across all roots. A file appearing under both roots
+    # (e.g. when /var/log/apache2/domlogs is a symlink tree of
+    # /usr/local/apache/domlogs) WILL be counted twice — the
+    # filesystem abstraction here is the bare path, not a realpath.
+    # Operators who want single-count semantics can dedupe at the
+    # reporting layer (examples/audit-diff.py works on the report,
+    # not the inventory). The upside is correctness: every root the
+    # operator explicitly listed is honored, and a cPanel host with
+    # two genuinely distinct file populations (e.g. addons outside
+    # the symlink tree) gets a complete inventory.
+    total_well_formed = 0
+    all_anomalies: list[dict[str, Any]] = []
+    all_subdirs: list[dict[str, str]] = []
+    any_root_existed = False
+    any_root_unreadable = False
+
+    for root in roots:
+        if not fs.is_dir(root):
+            continue
+        any_root_existed = True
+
+        # Defense in depth: wrap listdir so an ``fs`` substitute that
+        # raises PermissionError (e.g. AISO-124 tests) still produces
+        # a WARN, not a traceback. RealFileSystem.listdir already
+        # swallows PermissionError at the runner layer; this
+        # try/except is for non-Production runners that re-raise.
+        try:
+            names = fs.listdir(root)
+        except OSError as exc:
+            any_root_unreadable = True
+            findings.append(Finding(
+                module="domlog_inventory",
+                severity=Severity.WARN,
+                title="domlog directory is unreadable",
+                description=(
+                    f"Could not list {root!r}: {exc}. "
+                    "This is usually a permission problem — the audit user "
+                    "needs at least read+execute on the directory."
+                ),
+                details={"path": root, "error": str(exc), "errno": getattr(exc, "errno", None)},
+                recommendation=(
+                    "Fix the directory permissions (e.g. `chmod a+rx` for "
+                    "the audit user or grant the user group membership)."
+                ),
+            ))
+            continue
+
+        # Distinguish "directory is empty" from "directory exists but is
+        # unreadable" so the operator gets an actionable signal.
+        if not names and not fs.is_readable_dir(root):
+            any_root_unreadable = True
+            findings.append(Finding(
+                module="domlog_inventory",
+                severity=Severity.WARN,
+                title="domlog directory is unreadable",
+                description=(
+                    f"{root!r} is a directory but could not be listed "
+                    "(permission denied). The audit cannot enumerate domlog "
+                    "filenames."
+                ),
+                details={"path": root},
+                recommendation=(
+                    "Grant the audit user read+execute on the domlog root."
+                ),
+            ))
+            continue
+
+        if len(names) > settings["max_entries"]:
+            findings.append(Finding(
+                module="domlog_inventory",
+                severity=Severity.WARN,
+                title="Domlog directory is unexpectedly large",
+                description=(
+                    f"Found {len(names)} entries under {root!r} "
+                    f"(threshold {settings['max_entries']}). Either the host "
+                    "is multi-tenant at very large scale, or the directory is "
+                    "being polluted."
+                ),
+                details={"count": len(names), "path": root},
+            ))
+
+        for name in names:
+            # Skip mod_log_config byte counters and cPanel offset
+            # backups at the discovery layer so they don't trip the
+            # filename-shape detector. Real access logs (`<domain>`,
+            # `<domain>-ssl_log`) are not affected.
+            if should_skip_filename(name):
+                continue
+
+            full = f"{root.rstrip('/')}/{name}"
+
+            if fs.is_dir(full):
+                all_subdirs.append({"subdir": name, "root": root})
+                continue
+            reason = _is_anomalous_filename(name)
+            if reason is not None:
+                all_anomalies.append({"filename": name, "root": root, **reason})
+            else:
+                total_well_formed += 1
+
+    if not any_root_existed:
+        # None of the configured roots exist. Emit a single INFO
+        # listing all of them so the operator can see why no scan ran.
         findings.append(Finding(
             module="domlog_inventory",
             severity=Severity.INFO,
             title="domlog directory not present",
-            description=f"{domlog_root!r} does not exist or is not a directory.",
-            details={"path": domlog_root},
+            description=(
+                "None of the configured domlog roots exist on this host. "
+                "On a CloudLinux / cPanel box, check both "
+                "/var/log/apache2/domlogs and /usr/local/apache/domlogs."
+            ),
+            details={"roots_checked": roots},
         ))
         return findings
 
-    # Defense in depth: wrap listdir so an ``fs`` substitute that
-    # raises PermissionError (e.g. AISO-124 tests) still produces a
-    # WARN, not a traceback. RealFileSystem.listdir already swallows
-    # PermissionError at the runner layer; this try/except is for
-    # non-Production runners that re-raise.
-    try:
-        names = fs.listdir(domlog_root)
-    except OSError as exc:
-        findings.append(Finding(
-            module="domlog_inventory",
-            severity=Severity.WARN,
-            title="domlog directory is unreadable",
-            description=(
-                f"Could not list {domlog_root!r}: {exc}. "
-                "This is usually a permission problem — the audit user "
-                "needs at least read+execute on the directory."
-            ),
-            details={"path": domlog_root, "error": str(exc), "errno": getattr(exc, "errno", None)},
-            recommendation=(
-                "Fix the directory permissions (e.g. `chmod a+rx` for "
-                "the audit user or grant the user group membership)."
-            ),
-        ))
-        return findings
+    if any_root_unreadable:
+        # Findings for unreadable roots are already appended inside the
+        # loop; we don't add a second aggregated one to avoid duplication.
+        pass
 
-    # Distinguish "directory is empty" from "directory exists but is
-    # unreadable" so the operator gets an actionable signal.
-    if not names and not fs.is_readable_dir(domlog_root):
-        findings.append(Finding(
-            module="domlog_inventory",
-            severity=Severity.WARN,
-            title="domlog directory is unreadable",
-            description=(
-                f"{domlog_root!r} is a directory but could not be listed "
-                "(permission denied). The audit cannot enumerate domlog "
-                "filenames."
-            ),
-            details={"path": domlog_root},
-            recommendation=(
-                "Grant the audit user read+execute on the domlog root."
-            ),
-        ))
-        return findings
-
-    if len(names) > settings["max_entries"]:
-        findings.append(Finding(
-            module="domlog_inventory",
-            severity=Severity.WARN,
-            title="Domlog directory is unexpectedly large",
-            description=(
-                f"Found {len(names)} entries (threshold {settings['max_entries']}). "
-                "Either the host is multi-tenant at very large scale, or the "
-                "directory is being polluted."
-            ),
-            details={"count": len(names), "path": domlog_root},
-        ))
-
-    anomalies: list[dict[str, Any]] = []
-    well_formed = 0
-    subdirs: list[str] = []
-    for name in names:
-        full = f"{domlog_root.rstrip('/')}/{name}"
-        if fs.is_dir(full):
-            subdirs.append(name)
-            continue
-        reason = _is_anomalous_filename(name)
-        if reason is not None:
-            anomalies.append({"filename": name, **reason})
-        else:
-            well_formed += 1
-
-    if subdirs:
+    if all_subdirs:
         # Subdirectories under domlogs are a structural anomaly. cPanel
         # writes a flat list of per-domain files there. A subdir like
         # `domlogs/zmrk2md30edvm/hostdzire.com` indicates that an account
         # ID was used as a directory name — almost always an error or a
         # misconfigured addon domain.
-        sev = Severity.CRITICAL if len(subdirs) > 1 else Severity.WARN
+        sev = Severity.CRITICAL if len(all_subdirs) > 1 else Severity.WARN
         findings.append(Finding(
             module="domlog_inventory",
             severity=sev,
-            title=f"Unexpected sub-directory under domlogs: {len(subdirs)}",
+            title=f"Unexpected sub-directory under domlogs: {len(all_subdirs)}",
             description=(
                 "Domlog files are expected to be flat per-domain entries. "
                 "Sub-directories usually indicate an account-id layout (e.g. "
                 "/domlogs/<cpanel-user>/) that bypasses standard log parsing."
             ),
-            details={"subdirectories": subdirs, "path": domlog_root},
+            details={"subdirectories": all_subdirs},
             recommendation="Inspect the subdirectory layout; cPanel addons often misbehave here.",
         ))
 
-    if anomalies:
-        crit = sum(1 for a in anomalies if a["reason"] in {"filename_too_long", "shell_metacharacters"})
+    if all_anomalies:
+        crit = sum(1 for a in all_anomalies if a["reason"] in {"filename_too_long", "shell_metacharacters"})
         sev = Severity.CRITICAL if crit else Severity.WARN
         findings.append(Finding(
             module="domlog_inventory",
             severity=sev,
-            title=f"{len(anomalies)} anomalous domlog filename(s)",
+            title=f"{len(all_anomalies)} anomalous domlog filename(s)",
             description=(
                 "One or more entries in the domlog directory do not match the "
                 "expected per-domain layout (e.g. 'hostdzire.com', "
@@ -349,7 +403,7 @@ def analyze_domlog_inventory(
                 "(fuzzing), shell metacharacters (injection attempt), or "
                 "single-character repetitions."
             ),
-            details={"anomalies": anomalies, "well_formed_count": well_formed},
+            details={"anomalies": all_anomalies, "well_formed_count": total_well_formed},
             recommendation=(
                 "Quarantine and review these filenames; they are almost never "
                 "generated by a legitimate cPanel account."
@@ -359,9 +413,13 @@ def analyze_domlog_inventory(
         findings.append(Finding(
             module="domlog_inventory",
             severity=Severity.INFO,
-            title=f"{well_formed} well-formed domlog file(s)",
-            description="All domlog entries match the expected layout.",
-            details={"path": domlog_root, "count": well_formed},
+            title=f"{total_well_formed} well-formed domlog file(s)",
+            description=(
+                f"All domlog entries across {len(roots)} root(s) match the "
+                "expected layout. -bytes_log and offset backups are "
+                "intentionally skipped."
+            ),
+            details={"roots_scanned": [r for r in roots if fs.is_dir(r)], "count": total_well_formed},
         ))
 
     return findings

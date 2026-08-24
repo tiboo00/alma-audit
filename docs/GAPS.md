@@ -305,7 +305,8 @@ but always "what new file does this belong in".
 | `analyzers/access_log/rules.py` | 205 | 🟢 ok | D1/D4/D2/D5 detection rules |
 | `analyzers/access_log/analyzer.py` | 125 | 🟢 ok | orchestrator: `analyze_access_logs()` public entry |
 | `analyzers/access_log/__init__.py` | 41 | 🟢 ok | re-exports only, no logic |
-| `analyzers/domlog_inventory.py` | 367 | 🟢 ok | could split: `domlog_filename.py` + `domlog_layout.py` |
+| `analyzers/domlog_roots.py` | 68 | 🟢 ok | AISO-194 — multi-root + bytes_log exclusion defaults |
+| `analyzers/domlog_inventory.py` | 425 | 🟢 ok | walks multiple roots; could split: `domlog_filename.py` + `domlog_layout.py` if it crosses 600 |
 | `analyzers/modsec_log.py` | 351 | 🟢 ok | could split: `modsec_parser.py` + `modsec_analyze.py` |
 | `analyzers/crawler_verify.py` | 317 | 🟢 ok | tightly scoped (one verification chain); keep as-is |
 | `analyzers/secure_log/parser.py` | 281 | 🟢 ok | AISO-186 — syslog + sudo + useradd regexes |

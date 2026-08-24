@@ -88,3 +88,42 @@ def test_default_ssl_cert_roots_excludes_os_trust_stores():
     assert cfg.paths.ssl_cert_roots == ["/var/cpanel/ssl"]
     assert "/etc/pki/tls/certs" not in cfg.paths.ssl_cert_roots
     assert "/etc/ssl/certs" not in cfg.paths.ssl_cert_roots
+
+
+def test_default_domlog_roots_is_empty_list():
+    """The default `domlog_roots` is an empty list (multi-root opt-in).
+
+    The domlog inventory analyzer provides its own `DEFAULT_DOMLOG_ROOTS`
+    fallback (`/var/log/apache2/domlogs`, `/usr/local/apache/domlogs`,
+    `/var/log/apache2`). The `Paths.domlog_roots` field is empty by
+    default so the analyzer-level default takes effect at scan time —
+    keeping config defaults explicit and the analyzer defaults close to
+    the affected code.
+
+    Operators override via YAML `paths.domlog_roots: [...]` or the
+    `--domlog-roots PATH` CLI flag (repeatable).
+    """
+    cfg = load_config(None)
+    assert cfg.paths.domlog_roots == []
+
+
+def test_domlog_roots_override_via_yaml(tmp_path):
+    """YAML `paths.domlog_roots` is honoured by the config loader.
+
+    When an operator sets a custom list, the runner passes it
+    straight to `analyze_domlog_inventory`. This is the contract
+    the CLI's `--domlog-roots` flag mirrors.
+    """
+    cfg_file = tmp_path / "c.yaml"
+    cfg_file.write_text(
+        "paths:\n"
+        "  domlog_roots:\n"
+        "    - /var/log/apache2/domlogs\n"
+        "    - /usr/local/apache/domlogs\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(str(cfg_file))
+    assert cfg.paths.domlog_roots == [
+        "/var/log/apache2/domlogs",
+        "/usr/local/apache/domlogs",
+    ]

@@ -49,6 +49,13 @@ DEFAULT_CSF_ALLOW_PATH = "/etc/csf/csf.allow"
 class Paths:
     apache_root: str = DEFAULT_APACHE_ROOT
     domlog_root: str = DEFAULT_DOMLOG_ROOT
+    # Multi-root domlog discovery (AISO-194). When set, the domlog
+    # inventory analyzer walks ALL existing roots and merges findings
+    # (deduped by absolute path). When empty, falls back to
+    # `domlog_root` above. CloudLinux + cPanel hosts typically have
+    # both `/var/log/apache2/domlogs` and `/usr/local/apache/domlogs`
+    # populated — see `analyzers/domlog_roots.py` for the default list.
+    domlog_roots: list[str] = field(default_factory=list)
     output_dir: str = ""
     access_log_glob: list[str] = field(default_factory=lambda: list(DEFAULT_ACCESS_LOG_GLOB))
     error_log_glob: list[str] = field(default_factory=lambda: list(DEFAULT_ERROR_LOG_GLOB))

@@ -53,7 +53,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--domlog-root",
         default=None,
-        help=f"domlog directory (default: {DEFAULT_DOMLOG_ROOT}).",
+        help=f"domlog directory (default: {DEFAULT_DOMLOG_ROOT}). "
+             "Deprecated for multi-root layouts — prefer --domlog-roots (repeatable).",
+    )
+    parser.add_argument(
+        "--domlog-roots",
+        action="append",
+        metavar="PATH",
+        default=None,
+        help="Add an additional domlog root to scan. Repeat the flag for "
+             "multiple paths (e.g. --domlog-roots /var/log/apache2/domlogs "
+             "--domlog-roots /usr/local/apache/domlogs). On CloudLinux + "
+             "cPanel hosts both /var/log/apache2/domlogs and "
+             "/usr/local/apache/domlogs are typically populated; this flag "
+             "lets the inventory analyzer scan both without symlinking.",
     )
     parser.add_argument(
         "--output", "-o",
@@ -78,7 +91,16 @@ def _apply_cli_overrides(cfg: Config, args: argparse.Namespace) -> Config:
     if args.apache_root is not None:
         cfg.paths.apache_root = args.apache_root
     if args.domlog_root is not None:
+        # `--domlog-root PATH` sets the single-root path. Kept for
+        # backward compatibility — pre-AISO-194 operators had only
+        # this flag. New code should prefer `--domlog-roots` (repeated
+        # for multiple paths).
         cfg.paths.domlog_root = args.domlog_root
+    if getattr(args, "domlog_roots", None):
+        # `--domlog-roots PATH` (repeatable) sets the multi-root list.
+        # When set, this overrides `domlog_root` at the analyzer layer
+        # (the runner prefers a non-empty `domlog_roots`).
+        cfg.paths.domlog_roots = list(args.domlog_roots)
     return cfg
 
 

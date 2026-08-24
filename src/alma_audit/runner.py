@@ -187,7 +187,7 @@ def run_analyzers(cfg: Config, fs: FileSystem) -> list[Finding]:
     ))
 
     findings.extend(analyze_domlog_inventory(
-        cfg.paths.domlog_root,
+        cfg.paths.domlog_roots or [cfg.paths.domlog_root],
         fs,
         rules=cfg.modules.get("domlog_inventory", {}),
     ))

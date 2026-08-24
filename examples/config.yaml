@@ -9,6 +9,13 @@
 paths:
   apache_root: /var/log/apache2
   domlog_root: /var/log/apache2/domlogs
+  # Multi-root domlog discovery (AISO-194). On CloudLinux + cPanel hosts
+  # both /var/log/apache2/domlogs and /usr/local/apache/domlogs are
+  # typically populated. When `domlog_roots` is set, the analyzer walks
+  # all listed roots and the well-formed count + anomaly list are the
+  # SUM across roots (no dedup — the analyzer sees bare paths, not
+  # realpaths). Leave empty (the default) to fall back to `domlog_root`.
+  domlog_roots: []
   # Glob patterns (one basename per entry). The analyzer globs the
   # apache_root against each pattern.
   access_log_glob:
