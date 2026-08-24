@@ -520,3 +520,96 @@ def test_analyzer_certificate_expiry_boundary_thresholds(tmp_path):
     brute = [f for f in findings if "1.2.3.4" in f.title]
     assert len(brute) == 1
     assert brute[0].severity == Severity.CRITICAL
+
+
+# ---------------------------------------------------------------------------
+# AISO-207: YAML-configurable thresholds for the SSH invalid-user counter.
+#
+# The default `ssh_invalid_user_warn` / `ssh_invalid_user_crit` mirror the
+# ssh_fail pair (5 / 20). The override lets an operator with a known
+# scanner landscape (masscan / research / a friendly bot) raise the bar
+# so the per-IP brute-force rule doesn't page on a normal "Invalid user
+# evil / Invalid user ghost / ..." username-enumeration pass.
+# ---------------------------------------------------------------------------
+
+
+def _log_with_n_invalid_users(n: int, ip: str = "1.2.3.4") -> str:
+    """Build a synthetic secure.log of N `Invalid user X from <ip>` lines.
+
+    Only `ssh_invalid_user` events — no `ssh_fail` — so the IP's brute-force
+    total equals its invalid-user count. The test pins the behaviour of
+    `ssh_invalid_user_warn` / `ssh_invalid_user_crit` independently from
+    the combined `ssh_fail_*` thresholds.
+    """
+    lines = []
+    for i in range(n):
+        lines.append(
+            f"Aug 17 04:12:{i:02d} host sshd[1234]: "
+            f"Invalid user evil{i} from {ip} port {12345 + i}"
+        )
+    return "\n".join(lines)
+
+
+def test_override_ssh_invalid_user_warn_lowers_threshold():
+    """AISO-207: 3 invalid-user events trip WARN when warn=3.
+
+    Default ssh_invalid_user_warn=5, so 3 events stay silent. With
+    `modules.secure_log.ssh_invalid_user_warn: 3` the same log must trip
+    the per-IP brute-force finding at WARN.
+    """
+    log = _log_with_n_invalid_users(3)  # below default (5), at override (3)
+    fs = FakeFileSystem(files={"/var/log/secure": log})
+    findings = analyze_secure_logs(
+        ["/var/log/secure"], fs,
+        rules={"ssh_invalid_user_warn": 3, "ssh_invalid_user_crit": 100},
+    )
+    brute = [f for f in findings if "1.2.3.4" in f.title and "brute-force" in f.title.lower()]
+    assert brute, (
+        f"3 invalid-user events must trip brute-force WARN at "
+        f"ssh_invalid_user_warn=3; got findings: "
+        f"{[(f.severity.name, f.title) for f in findings]}"
+    )
+    assert brute[0].severity == Severity.WARN
+
+
+def test_default_ssh_invalid_user_thresholds_unchanged_without_override():
+    """AISO-207 AC #5: anti-regression — defaults stay 5/20.
+
+    With no override, 4 invalid-user events stay silent (below warn=5).
+    21 invalid-user events trip CRITICAL (above crit=20).
+    """
+    # Below default warn (5) → silent.
+    fs = FakeFileSystem(files={"/var/log/secure": _log_with_n_invalid_users(4)})
+    findings = analyze_secure_logs(["/var/log/secure"], fs)
+    brute = [f for f in findings if "1.2.3.4" in f.title and "brute-force" in f.title.lower()]
+    assert not brute, (
+        f"4 invalid-user events must NOT trip brute-force under defaults; "
+        f"got: {[(f.severity.name, f.title) for f in brute]}"
+    )
+
+    # Above default crit (20) → CRITICAL.
+    fs = FakeFileSystem(files={"/var/log/secure": _log_with_n_invalid_users(21)})
+    findings = analyze_secure_logs(["/var/log/secure"], fs)
+    brute = [f for f in findings if "1.2.3.4" in f.title and "brute-force" in f.title.lower()]
+    assert brute, "21 invalid-user events must trip brute-force under defaults"
+    assert brute[0].severity == Severity.CRITICAL
+
+
+def test_ssh_invalid_user_threshold_independent_from_ssh_fail():
+    """AISO-207: the invalid-user threshold overrides WITHOUT touching ssh_fail.
+
+    An operator who only wants to relax the username-enumeration rule
+    (`ssh_invalid_user_warn: 100`) must NOT silently raise the
+    credential-stuffing bar — `ssh_fail_warn` stays at its default (5).
+    """
+    log = _log_with_n_invalid_users(3)  # 3 invalid-user lines, NO ssh_fail
+    fs = FakeFileSystem(files={"/var/log/secure": log})
+    findings = analyze_secure_logs(
+        ["/var/log/secure"], fs,
+        rules={"ssh_invalid_user_warn": 100},
+    )
+    brute = [f for f in findings if "1.2.3.4" in f.title and "brute-force" in f.title.lower()]
+    assert not brute, (
+        f"with ssh_invalid_user_warn=100, 3 invalid-user events must stay "
+        f"silent; got: {[(f.severity.name, f.title) for f in brute]}"
+    )

@@ -538,3 +538,135 @@ def test_aiso206_full_report_and_forensic_share_sorted_anomalies():
         "alma-audit-forensic.json `domlog_anomalies` drifted from "
         "alma-audit-latest.json `details.anomalies`"
     )
+
+
+# ---------------------------------------------------------------------------
+# AISO-207: YAML-configurable thresholds.
+#
+# The acceptance criteria require:
+#   * `modules.domlog_inventory.length_warn` overrides the LENGTH_WARN
+#     constant at the analyzer level. A 35-char filename is benign under
+#     the default 60-char threshold, but MUST trip WARN when the operator
+#     drops length_warn to 30.
+#   * Defaults stay unchanged when the override is absent — the
+#     `test_unusually_long_but_under_crit_is_warn` body above already
+#     exercises the 60/120 default pair; the anti-regression test below
+#     pins the 30-char boundary in the OTHER direction (length exactly
+#     AT the default threshold still trips WARN — no off-by-one).
+# ---------------------------------------------------------------------------
+
+
+def test_override_length_warn_lowers_threshold():
+    """AISO-207 AC #4: feed `length_warn: 30`; a 35-char name trips WARN.
+
+    The default length_warn is 60, so a 35-char filename is silent. With
+    `modules.domlog_inventory.length_warn: 30` the same name must trip
+    `filename_unusually_long` at the lowered threshold.
+    """
+    name = "a" * 35  # above the override (30), below the default (60)
+    fs = _fs_with({f"{DOMLOG_ROOT}/{name}": "log"})
+    findings = analyze_domlog_inventory(
+        [DOMLOG_ROOT], fs,
+        rules={"length_warn": 30, "length_crit": 120},
+    )
+    warns = [f for f in findings if f.severity == Severity.WARN]
+    assert warns, "expected WARN finding after lowering length_warn"
+    matching = [
+        a for a in warns[0].details.get("anomalies", [])
+        if a.get("reason") == "filename_unusually_long"
+        and a.get("filename") == name
+    ]
+    assert matching, (
+        f"expected filename_unusually_long finding for {name!r} at "
+        f"length_warn=30, got anomalies: "
+        f"{warns[0].details.get('anomalies', [])}"
+    )
+    assert matching[0]["threshold"] == 30, (
+        f"threshold in finding detail must reflect the override (30), "
+        f"got {matching[0]['threshold']}"
+    )
+
+
+def test_default_length_warn_threshold_unchanged_when_no_override():
+    """AISO-207 AC #5: anti-regression — no override keeps the 60/120 defaults.
+
+    A 35-char filename (above the lowered threshold, below the default)
+    stays silent when the operator has NOT configured `length_warn`.
+    Catches the regression "operator forgot the override, analyzer
+    silently lowered the threshold anyway".
+
+    Uses a multi-character name (`a1b2c3...`) so the repeated-character
+    detector (default min_len=20, ratio=0.8) does NOT trip — only the
+    length threshold applies.
+    """
+    # Build a 35-char name with diverse characters so it's NOT a fuzz
+    # repetition. `a1b2c3...` is below the default LENGTH_WARN (60) and
+    # matches `_DOMLOG_FILE_RE` (letters/digits/dots/hyphens) — so under
+    # default rules it's well-formed; with `length_warn: 30` it must
+    # trip `filename_unusually_long`.
+    chars = "abcdefghijklmnopqrstuvwxyz0123456789"  # 36 chars pool
+    name = (chars * 2)[:35]
+    assert len(name) == 35
+    # Sanity: this name is NOT a repeat-pattern (every char distinct in
+    # the first 36 pool, so first 35 are distinct → ratio 1/35 < 0.8).
+    fs = _fs_with({f"{DOMLOG_ROOT}/{name}": "log"})
+    findings = analyze_domlog_inventory([DOMLOG_ROOT], fs)
+    flagged = [
+        f for f in findings
+        if any(a.get("filename") == name for a in f.details.get("anomalies", []))
+    ]
+    assert not flagged, (
+        f"35-char multi-character filename must NOT be flagged with "
+        f"default thresholds; got findings: {[f.title for f in flagged]}"
+    )
+
+
+def test_override_length_crit_lowers_critical_threshold():
+    """AISO-207: lowering length_crit escalates 100-char names to CRITICAL.
+
+    Default length_crit is 120, so a 100-char name is WARN. With
+    length_crit=80 the same name must trip CRITICAL.
+    """
+    name = "a" * 100  # above the override (80), below the default (120)
+    fs = _fs_with({f"{DOMLOG_ROOT}/{name}": "log"})
+    findings = analyze_domlog_inventory(
+        [DOMLOG_ROOT], fs,
+        rules={"length_warn": 60, "length_crit": 80},
+    )
+    crits = [f for f in findings if f.severity == Severity.CRITICAL]
+    matching = [
+        a for a in crits[0].details.get("anomalies", [])
+        if a.get("filename") == name
+        and a.get("reason") == "filename_too_long"
+    ]
+    assert matching, (
+        f"expected filename_too_long CRITICAL for {name!r} at "
+        f"length_crit=80, got findings: {[f.title for f in findings]}"
+    )
+    assert matching[0]["threshold"] == 80
+
+
+def test_override_repeat_min_len_lowers_repeat_threshold():
+    """AISO-207: lowering repeat_min_len flags shorter fuzzing artifacts.
+
+    Default REPEAT_MIN_LEN=20 + REPEAT_RATIO=0.8. A 15-char string of 'A'
+    is silent by default. With `repeat_min_len: 10` the same string must
+    trip `repeated_character_pattern`.
+    """
+    name = "A" * 15  # above the override (10), below the default (20)
+    fs = _fs_with({f"{DOMLOG_ROOT}/{name}": "log"})
+    findings = analyze_domlog_inventory(
+        [DOMLOG_ROOT], fs,
+        rules={"repeat_min_len": 10, "repeat_ratio": 0.8},
+    )
+    flagged = [
+        a for f in findings
+        for a in f.details.get("anomalies", [])
+        if a.get("reason") == "repeated_character_pattern"
+        and a.get("filename") == name
+    ]
+    assert flagged, (
+        f"expected repeated_character_pattern for {name!r} at "
+        f"repeat_min_len=10, got findings: "
+        f"{[f.title for f in findings]}"
+    )

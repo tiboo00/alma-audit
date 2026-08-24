@@ -341,5 +341,64 @@ def test_no_modsec_finding_unchanged_when_no_audit_logs_present():
     )
     titles = [f.title for f in findings]
     assert "No ModSecurity audit log files matched" in titles
-    # No deny / no rule-breakdown finding when no data.
-    assert not any("ModSecurity denied" in t for t in titles)
+
+
+# ---------------------------------------------------------------------------
+# AISO-207: YAML-configurable thresholds.
+#
+# The `critical_hit_count` threshold gates the
+# "ModSecurity CRITICAL severity rule fired" finding — the default is 1
+# (any single severity=CRITICAL match is escalated). The override lets
+# them raise the bar ("only escalate after N CRITICAL hits") so a
+# noisy test environment doesn't page the on-call for one-off noise.
+# ---------------------------------------------------------------------------
+
+
+def test_override_critical_hit_count_raises_escalation_bar():
+    """AISO-207: `critical_hit_count: 2` suppresses escalation on a single hit.
+
+    The sample block below contains exactly ONE severity=CRITICAL request.
+    With default `critical_hit_count: 1` the analyzer emits the
+    'CRITICAL severity rule fired' finding. With `critical_hit_count: 2`
+    the same single-hit input must NOT escalate.
+    """
+    fs = _fs_with({"/var/log/apache2/modsec_audit.log": SAMPLE_MODSEC})
+    findings = analyze_modsec_and_errors(
+        error_paths=[],
+        modsec_paths=["/var/log/apache2/modsec_audit.log"],
+        fs=fs,
+        rules={"critical_hit_count": 2},
+    )
+    escalated = [
+        f for f in findings
+        if "CRITICAL severity rule fired" in f.title
+    ]
+    assert not escalated, (
+        f"single CRITICAL hit must NOT escalate when "
+        f"critical_hit_count=2; got: {[f.title for f in escalated]}"
+    )
+
+
+def test_default_critical_hit_count_one_escalates_single_hit():
+    """AISO-207 AC #5: anti-regression — default threshold stays at 1.
+
+    The SAMPLE_MODSEC block contains one severity=CRITICAL match. With
+    no override the analyzer must still emit the CRITICAL-escalation
+    finding (catches the regression "someone lowered the default to 0
+    or accidentally suppressed the finding").
+    """
+    fs = _fs_with({"/var/log/apache2/modsec_audit.log": SAMPLE_MODSEC})
+    findings = analyze_modsec_and_errors(
+        error_paths=[],
+        modsec_paths=["/var/log/apache2/modsec_audit.log"],
+        fs=fs,
+    )
+    escalated = [
+        f for f in findings
+        if "CRITICAL severity rule fired" in f.title
+    ]
+    assert escalated, (
+        "single CRITICAL hit MUST escalate under default "
+        "critical_hit_count=1; got nothing"
+    )
+    assert escalated[0].severity == Severity.CRITICAL

@@ -49,6 +49,15 @@ def rule_ssh_brute_force(
     trips the rule. The aggregator keeps the two counters separate
     so the operator can tell which attack pattern they are seeing
     in the report's `details`.
+
+    AISO-207: the per-pattern threshold pair is now operator-tunable.
+    `ssh_fail_warn` / `ssh_fail_crit` gate the combined credential-
+    stuffing bar, `ssh_invalid_user_warn` / `ssh_invalid_user_crit`
+    gate the username-enumeration bar. An IP carrying only one
+    pattern is scored against that pattern's threshold (not the
+    combined sum), so an operator who only wants to relax the
+    enumeration bar does NOT silently raise the credential-stuffing
+    bar.
     """
     n_a = CrawlerSuppression.not_applicable().to_dict()
     findings: list[Finding] = []
@@ -56,6 +65,14 @@ def rule_ssh_brute_force(
     all_ips = set(agg.ssh_fail_by_ip) | set(agg.ssh_invalid_user_by_ip)
     if not all_ips:
         return findings
+    fail_warn = int(settings["ssh_fail_warn"])
+    fail_crit = int(settings["ssh_fail_crit"])
+    invalid_warn = int(
+        settings.get("ssh_invalid_user_warn", settings["ssh_fail_warn"])
+    )
+    invalid_crit = int(
+        settings.get("ssh_invalid_user_crit", settings["ssh_fail_crit"])
+    )
     # Pre-compute the per-IP totals and sort by combined count desc,
     # then by IP ascending as a STABLE tie-breaker. Without the IP
     # tie-breaker, ties land in `set(...)` iteration order, which is
@@ -69,13 +86,30 @@ def rule_ssh_brute_force(
         combined.append((ip, fail_count, invalid_count))
     combined.sort(key=lambda t: (-(t[1] + t[2]), t[0]))
     for ip, fail_count, invalid_count in combined:
-        total = fail_count + invalid_count
-        if total >= settings["ssh_fail_crit"]:
-            sev = Severity.CRITICAL
-        elif total >= settings["ssh_fail_warn"]:
-            sev = Severity.WARN
+        # AISO-207: per-pattern severity — score each counter against
+        # its OWN threshold pair. The combined total still appears in
+        # the finding details, but the severity is the max of the two
+        # pattern-level severities so an operator who relaxes ONE pair
+        # doesn't accidentally relax the other.
+        def _sev(count: int, warn: int, crit: int) -> Severity | None:
+            if count >= crit:
+                return Severity.CRITICAL
+            if count >= warn:
+                return Severity.WARN
+            return None
+
+        fail_sev = _sev(fail_count, fail_warn, fail_crit)
+        invalid_sev = _sev(invalid_count, invalid_warn, invalid_crit)
+        # Highest-severity wins; ties fall back to credential-stuffing
+        # (fail) because it's the more dangerous attack pattern.
+        sev_order = {Severity.CRITICAL: 2, Severity.WARN: 1, None: 0}
+        if sev_order[fail_sev] >= sev_order[invalid_sev]:
+            sev = fail_sev
         else:
+            sev = invalid_sev
+        if sev is None:
             continue
+        total = fail_count + invalid_count
         findings.append(Finding(
             module="secure_log",
             severity=sev,
