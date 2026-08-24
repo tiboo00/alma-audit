@@ -227,58 +227,33 @@ _TOP_PATH_IP_UA_LIMIT = 50
 def _serialise_top_path_ip_ua(agg: AccessAggregator) -> list[dict[str, Any]]:
     """Flatten every (path, ip) bucket into per-UA rows, ranked by count.
 
-    The aggregator tracks user-agents per (path, ip) pair — each bucket
-    may hold up to 5 distinct UAs. We expand those into one row per
-    (path, ip, ua) triple, sorted by count desc, so the operator sees
-    the highest-volume UA-on-which-path combination first. The per-(path,
-    ip) total count is split evenly across the bucket's UAs only when
-    the bucket actually held multiple UAs; for the common single-UA
-    case the row carries the full bucket count, which is what the
-    operator expects ("× 27 requests using python-requests/2.28.0").
+    AISO-208 review fix: the previous implementation divided the bucket
+    total evenly across the UAs in ``stat.user_agents`` and assigned
+    the remainder to the last UA — a *fabricated* breakdown that
+    produced e.g. ``5/5`` for a real ``9× ua-A + 1× ua-B`` input.
+    The operator relied on those numbers and the report was provably
+    wrong.
 
-    The full per-(path, ip, UA) breakdown is preserved in
-    `probe_paths_by_ip` for the forensic JSON consumers; this list is
-    the trimmed operator-eye view rendered in the MD summary.
+    The aggregator now tracks exact per-UA counts in
+    ``_PerIPProbeStat.ua_counts`` (an unbounded ``Counter[str]``).
+    We read those counts directly here — no arithmetic, no
+    approximation. The full per-(path, ip, UA) breakdown is preserved
+    in ``probe_paths_by_ip`` for the forensic JSON consumers; this
+    list is the trimmed operator-eye view rendered in the MD summary.
     """
     rows: list[dict[str, Any]] = []
     for path, ip_map in agg.probe_by_path_ip.items():
         for ip, stat in ip_map.items():
-            bucket_count = stat.count
-            uas = list(stat.user_agents)
-            if not uas:
-                # No UA tracked — emit a single "<unknown>" row so the
-                # bucket still appears in the operator's view.
-                rows.append({
-                    "path": path,
-                    "ip": ip,
-                    "user_agent": "<unknown>",
-                    "count": bucket_count,
-                })
-                continue
-            if len(uas) == 1:
-                rows.append({
-                    "path": path,
-                    "ip": ip,
-                    "user_agent": uas[0],
-                    "count": bucket_count,
-                })
-                continue
-            # Multiple UAs in one bucket — distribute the bucket count
-            # across the UAs that were seen. This is an approximation
-            # (we don't track per-UA counts inside the bucket today)
-            # but it preserves the invariant "sum of UA counts in a
-            # bucket = bucket total count", which the operator can
-            # rely on. The forensic JSON carries the exact per-(path,
-            # ip) totals, so the operator can always drill in.
-            per_ua, remainder = divmod(bucket_count, len(uas))
-            for idx, ua in enumerate(uas):
+            # Emit one row per distinct UA with its REAL count.
+            # ``ua_counts`` is a Counter[str]; iteration order matches
+            # insertion order on Python 3.7+, so the operator sees the
+            # first-seen UA first within each bucket.
+            for ua, ua_count in stat.ua_counts.items():
                 rows.append({
                     "path": path,
                     "ip": ip,
                     "user_agent": ua,
-                    # Last UA absorbs the remainder so the rows sum
-                    # back to `bucket_count`.
-                    "count": per_ua + (remainder if idx == len(uas) - 1 else 0),
+                    "count": ua_count,
                 })
     rows.sort(key=lambda r: r["count"], reverse=True)
     return rows[:_TOP_PATH_IP_UA_LIMIT]
@@ -287,7 +262,15 @@ def _serialise_top_path_ip_ua(agg: AccessAggregator) -> list[dict[str, Any]]:
 def _serialise_probe_paths_by_ip(
     probe_by_path_ip: dict[str, dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
-    """Convert the aggregator's internal `_PerIPProbeStat` map to JSON-safe rows."""
+    """Convert the aggregator's internal `_PerIPProbeStat` map to JSON-safe rows.
+
+    AISO-208 review fix: each row now carries ``user_agent_counts``
+    (the exact per-UA hit counts from the aggregator's ``Counter[str]``)
+    alongside the existing ``user_agents`` list. Consumers that only
+    care about which UAs were seen keep reading ``user_agents``;
+    consumers that need the precise breakdown read
+    ``user_agent_counts``.
+    """
     out: dict[str, list[dict[str, Any]]] = {}
     for path, ip_map in probe_by_path_ip.items():
         rows = [
@@ -297,6 +280,7 @@ def _serialise_probe_paths_by_ip(
                 "first_seen": stat.first_seen,
                 "last_seen": stat.last_seen,
                 "user_agents": list(stat.user_agents),
+                "user_agent_counts": dict(stat.ua_counts),
             }
             for ip, stat in ip_map.items()
         ]

@@ -319,6 +319,20 @@ def build_forensic_export(
     ssh_fail_by_ip: list[dict[str, Any]] = []
     probe_paths_by_ip: dict[str, list[dict[str, Any]]] = {}
 
+    # AISO-208 (review-fix): the operator-facing Markdown report
+    # surfaces a top-N slice of the per-(path, IP, UA) breakdown as
+    # `top_path_ip_ua` and points the operator to
+    # `alma-audit-forensic.json` for "the full list". Before this fix,
+    # the forensic export carried only `probe_paths_by_ip` — the top-N
+    # slice was nowhere in the forensic JSON, so the MD's "full list
+    # in alma-audit-forensic.json" claim was false. We now collect the
+    # same slice into the forensic export so consumers (SIEM ingestion,
+    # incident response scripts) see exactly the rows the operator saw.
+    # The list is *appended* across all findings of the same kind;
+    # multiple findings (e.g. two probe detectors) are merged in
+    # finding order, which the orchestrator keeps deterministic.
+    top_path_ip_ua: list[dict[str, Any]] = []
+
     # AISO-206: the domlog inventory finding carries its full
     # `details.anomalies` payload already sorted by `_SORT_WEIGHTS`
     # (most-dangerous first, then filename ascending). We expose it
@@ -336,6 +350,11 @@ def build_forensic_export(
         details = getattr(f, "details", None) or {}
         if details.get("probe_paths_by_ip"):
             probe_paths_by_ip.update(details["probe_paths_by_ip"])
+        # AISO-208 (review-fix): carry the operator-facing top-N
+        # slice into the forensic JSON. Defensive copy via ``list(...)``
+        # so a downstream consumer can't mutate the Finding's payload.
+        for row in details.get("top_path_ip_ua", []) or []:
+            top_path_ip_ua.append(dict(row))
         for row in details.get("top_attackers", []) or []:
             scanner_ips.append({
                 "ip": row.get("ip"),
@@ -414,6 +433,16 @@ def build_forensic_export(
         "sudo_fail_users": sudo_fail_users,
         "ssh_fail_by_ip": ssh_fail_by_ip,
         "probe_paths_by_ip": probe_paths_by_ip,
+        # AISO-208 (review-fix): explicit top-N (path, IP, UA) slice.
+        # The Markdown report renders the first 10 of this list inline
+        # and points the operator at ``alma-audit-forensic.json`` for
+        # "the full list". The full *per-(path, ip)* breakdown lives
+        # under ``probe_paths_by_ip`` above; ``top_path_ip_ua`` is the
+        # same operator-facing slice the MD saw, kept for forensic
+        # consumers (SIEM, incident-response scripts) that don't
+        # re-parse the MD. Empty list is the correct sentinel when no
+        # probe finding surfaced.
+        "top_path_ip_ua": top_path_ip_ua,
         # AISO-206: explicit, full, already-sorted domlog anomalies.
         # The forensic JSON (`alma-audit-forensic.json`) keeps this
         # list intact so the operator can see the weighted ordering

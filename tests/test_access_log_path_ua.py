@@ -209,6 +209,229 @@ def test_forensic_json_distinguishes_same_ip_different_paths(make_fs):
 
 
 # ---------------------------------------------------------------------------
+# Review-fix regression locks (AISO-208 — path × IP × UA counts were fake).
+#
+# The first PR merged the MD surface, but the underlying counts were
+# fabricated: the serializer divided the bucket total evenly across the
+# tracked UAs and assigned the remainder to the last one. A real
+# 9× ua-A + 1× ua-B log came out as 5/5. These tests lock the fix:
+#
+#   * `_PerIPProbeStat` tracks an unbounded ``ua_counts`` counter.
+#   * `_serialise_top_path_ip_ua` reads those counts verbatim — no
+#     even split, no remainder heuristic.
+#   * The forensic JSON carries the top-N slice AND the
+#     ``user_agent_counts`` per-(path, ip) dict.
+# ---------------------------------------------------------------------------
+
+
+def test_path_ip_ua_counts_are_real_9_to_1_ratio():
+    """Review-fix regression: 9× ua-A + 1× ua-B must surface as 9/1, not 5/5.
+
+    Pre-fix behaviour: the bucket held ``user_agents=["ua-A", "ua-B"]``
+    with no per-UA counts. The serializer computed
+    ``per_ua, remainder = divmod(10, 2) = (5, 0)`` and emitted two
+    rows of 5 each — the operator was reading false numbers.
+    Post-fix: the bucket holds ``ua_counts={"ua-A": 9, "ua-B": 1}``
+    and the serializer reads those counts directly.
+    """
+    log_lines = [
+        '198.51.100.10 - - [17/Aug/2026:04:12:34 +0000] "GET /.env HTTP/1.1" 404 - "-" "ua-A"',
+    ] + [
+        f'198.51.100.10 - - [17/Aug/2026:04:12:{35 + i:02d} +0000] "GET /.env HTTP/1.1" 404 - "-" "ua-A"'
+        for i in range(8)  # 8 more ua-A → total 9 ua-A
+    ] + [
+        '198.51.100.10 - - [17/Aug/2026:04:13:00 +0000] "GET /.env HTTP/1.1" 404 - "-" "ua-B"',
+    ]
+    agg = _feed("\n".join(log_lines))
+
+    # Aggregate-side invariant: ua_counts must hold the exact 9/1 split.
+    bucket = agg.probe_by_path_ip["/.env"]["198.51.100.10"]
+    assert dict(bucket.ua_counts) == {"ua-A": 9, "ua-B": 1}
+    # Bucket total matches sum of per-UA counts.
+    assert bucket.count == sum(bucket.ua_counts.values()) == 10
+
+    # Serialiser-side invariant: the top list carries real counts.
+    from alma_audit.analyzers.access_log.rules import _serialise_top_path_ip_ua  # type: ignore[attr-defined]
+    rows = _serialise_top_path_ip_ua(agg)
+    by_ua = {(r["ip"], r["user_agent"]): r["count"] for r in rows}
+    assert by_ua[("198.51.100.10", "ua-A")] == 9
+    assert by_ua[("198.51.100.10", "ua-B")] == 1
+    # And — the explicit anti-regression check — NOT 5/5.
+    assert 5 not in by_ua.values(), (
+        "5/5 means the serializer still does an even split (review-fix regressed)"
+    )
+
+
+def test_path_ip_ua_tracks_more_than_five_distinct_user_agents():
+    """Review-fix regression: no 5-UA cap on the bucket.
+
+    Pre-fix behaviour: ``_PerIPProbeStat.user_agents`` was a list
+    capped at 5 — a rotating scanner surfaced UAs 0..6, but the bucket
+    only remembered 0..4. The operator saw a truncated distribution.
+    Post-fix: every distinct UA is tracked, in encounter order, with
+    its real per-UA count.
+    """
+    log_lines = [
+        f'198.51.100.20 - - [17/Aug/2026:04:12:{34 + i:02d} +0000] "GET /.env HTTP/1.1" 404 - "-" "ua-{i}"'
+        for i in range(7)  # 7 distinct UAs
+    ]
+    agg = _feed("\n".join(log_lines))
+    bucket = agg.probe_by_path_ip["/.env"]["198.51.100.20"]
+
+    assert len(bucket.user_agents) == 7
+    assert bucket.user_agents == [f"ua-{i}" for i in range(7)]
+    # Each UA was seen exactly once → each count == 1.
+    assert dict(bucket.ua_counts) == {f"ua-{i}": 1 for i in range(7)}
+    assert bucket.count == 7
+
+    # Same on the serialiser: 7 distinct rows, none dropped.
+    from alma_audit.analyzers.access_log.rules import _serialise_top_path_ip_ua  # type: ignore[attr-defined]
+    rows = _serialise_top_path_ip_ua(agg)
+    assert len(rows) == 7
+    assert {r["user_agent"] for r in rows} == {f"ua-{i}" for i in range(7)}
+
+
+def test_forensic_json_top_path_ip_ua_slice_is_present(make_fs):
+    """Review-fix regression: ``alma-audit-forensic.json`` carries the
+    operator-facing top-N ``top_path_ip_ua`` slice.
+
+    The Markdown report surfaces the first 10 of ``top_path_ip_ua``
+    inline and tells the operator "full list in alma-audit-forensic.json".
+    Before the review-fix, the forensic export omitted this slice
+    entirely — the MD's "full list" pointer was a lie. The forensic
+    JSON now carries the same slice (50 entries, the
+    ``_TOP_PATH_IP_UA_LIMIT`` cap) so consumers get exactly what the
+    operator saw.
+    """
+    fs = make_fs({"/var/log/apache2/access_log": TWO_PATH_TWO_UA_LOG})
+    findings = analyze_access_logs(["/var/log/apache2/access_log"], fs)
+
+    forensic = build_forensic_export(
+        findings, hostname="test-host", timestamp="2026-08-24T00:00:00",
+    )
+
+    # New key on the forensic export — the slice the MD rendered.
+    assert "top_path_ip_ua" in forensic, (
+        "forensic export must carry top_path_ip_ua so MD's 'full list in "
+        "alma-audit-forensic.json' claim is honest"
+    )
+    rows = forensic["top_path_ip_ua"]
+    assert isinstance(rows, list)
+    assert len(rows) >= 2, "expected both probe-path buckets in the slice"
+
+    # Each row carries path / ip / user_agent / count and the counts
+    # must be REAL — the review-fix invariant.
+    by_key = {(r["path"], r["ip"], r["user_agent"]): r["count"] for r in rows}
+    assert by_key[("/.env", "198.51.100.10", "python-requests/2.28.0")] == 15
+    assert by_key[("/wp-login.php", "198.51.100.10", "curl/8.4.0")] == 15
+
+
+def test_forensic_json_probe_paths_by_ip_carries_user_agent_counts(make_fs):
+    """Review-fix regression: every (path, ip) bucket carries
+    ``user_agent_counts`` with real per-UA values.
+
+    Pre-fix: each row in ``probe_paths_by_ip`` only carried
+    ``user_agents`` (the capped list of names) — no per-UA counts.
+    Post-fix: ``user_agent_counts`` is a ``{ua: count}`` dict sourced
+    directly from the aggregator's ``Counter[str]``, with no arithmetic
+    and no cap on the number of distinct UAs.
+    """
+    fs = make_fs({"/var/log/apache2/access_log": TWO_PATH_TWO_UA_LOG})
+    findings = analyze_access_logs(["/var/log/apache2/access_log"], fs)
+
+    forensic = build_forensic_export(
+        findings, hostname="test-host", timestamp="2026-08-24T00:00:00",
+    )
+    pp = forensic["probe_paths_by_ip"]
+
+    env_row = pp["/.env"][0]
+    wp_row = pp["/wp-login.php"][0]
+
+    # New field on every (path, ip) row.
+    assert "user_agent_counts" in env_row
+    assert "user_agent_counts" in wp_row
+
+    # Real values, not even-split fabrications.
+    assert env_row["user_agent_counts"] == {"python-requests/2.28.0": 15}
+    assert wp_row["user_agent_counts"] == {"curl/8.4.0": 15}
+
+    # Invariant: sum of per-UA counts == bucket total.
+    assert sum(env_row["user_agent_counts"].values()) == env_row["count"]
+    assert sum(wp_row["user_agent_counts"].values()) == wp_row["count"]
+
+    # Backward compatibility: ``user_agents`` (the ordered list of
+    # distinct UA names) still present for consumers that read only it.
+    assert env_row["user_agents"] == ["python-requests/2.28.0"]
+    assert wp_row["user_agents"] == ["curl/8.4.0"]
+
+
+def test_ua_counts_invariant_holds_for_records_without_user_agent():
+    """The ``count == sum(ua_counts.values())`` invariant must hold
+    even when records carry an empty UA string.
+
+    Records with an empty ``user_agent`` get bucketed under the
+    explicit ``"<unknown>"`` sentinel — without that, the invariant
+    would silently break for any future code path that synthesises
+    records without a UA (the parser already coerces ``None`` → ``""``).
+    We exercise the empty-UA branch directly via ``agg.add(record)``
+    rather than via ``parse_line``, because the live parser treats the
+    Apache literal ``"-"`` (which is a *real* string per RFC 9110)
+    as data — keeping that semantic out of scope here.
+    """
+    from alma_audit.analyzers.access_log.parser import AccessRecord
+    agg = AccessAggregator()
+    records = [
+        AccessRecord(
+            host="198.51.100.30",
+            path="/.env",
+            status=404,
+            method="GET",
+            timestamp="17/Aug/2026:04:12:34 +0000",
+            size=0,
+            user_agent="ua-A",
+        ),
+        AccessRecord(
+            host="198.51.100.30",
+            path="/.env",
+            status=404,
+            method="GET",
+            timestamp="17/Aug/2026:04:12:35 +0000",
+            size=0,
+            user_agent="",
+        ),
+        AccessRecord(
+            host="198.51.100.30",
+            path="/.env",
+            status=404,
+            method="GET",
+            timestamp="17/Aug/2026:04:12:36 +0000",
+            size=0,
+            user_agent="ua-A",
+        ),
+        AccessRecord(
+            host="198.51.100.30",
+            path="/.env",
+            status=404,
+            method="GET",
+            timestamp="17/Aug/2026:04:12:37 +0000",
+            size=0,
+            user_agent="",
+        ),
+    ]
+    for rec in records:
+        agg.add(rec)
+
+    bucket = agg.probe_by_path_ip["/.env"]["198.51.100.30"]
+
+    # Total count is 4 (all four records were probe hits).
+    assert bucket.count == 4
+    # Per-UA counts: 2 ua-A + 2 "<unknown>".
+    assert dict(bucket.ua_counts) == {"ua-A": 2, "<unknown>": 2}
+    # Invariant: bucket total equals the sum of per-UA counts.
+    assert bucket.count == sum(bucket.ua_counts.values())
+
+
+# ---------------------------------------------------------------------------
 # AC#3: Markdown summary surfaces the top path × top IP × UA combination.
 # ---------------------------------------------------------------------------
 
