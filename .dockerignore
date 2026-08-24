@@ -1,0 +1,68 @@
+# Files excluded from the Docker build context.
+#
+# Mirrors .gitignore for host dev artifacts (`.venv/`,
+# `.pytest_cache/`, `.coverage`, `*.egg-info/`) that MUST NOT leak
+# into the `alma-audit-dev:latest` image at build time, and into
+# the `/tmp/alma_audit_work` copy inside the container at run time
+# via the bind-mounted `/src` (`deploy/Dockerfile.dev` runs
+# `cp -a /src /tmp/alma_audit_work` from a bind mount, so the
+# build context affects both phases).
+#
+# Concrete incident (AISO-214 review, 2026-08-24): a host
+# `.venv/bin/python` symlinked to the host's `/usr/bin/python3`
+# gets copied into the container, where `/usr/bin/python3`
+# resolves to a *different* interpreter (the container's
+# `python3.6`/`python3.11` alternative). The
+# `tests/test_exit_codes.py::test_cli_exit_1_on_unreadable_apache_root_via_runuser`
+# test prefers `.venv/bin/python` when present, so `nobody` ends
+# up running an interpreter that can't `import yaml` and the test
+# fails. Excluding `.venv/` here makes the test fall back to
+# `sys.executable` (the container's `/usr/bin/python3.11`) which
+# has the right site-packages.
+
+# Python build / cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Virtual environments (host dev artifact — never ship)
+.venv/
+.venv-*/
+venv/
+env/
+
+# Test caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+
+# IDE / editor state
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# alma-audit runtime outputs (operators mount fresh logs at run time)
+alma-audit-out/
+
+# VCS + Multica workspace metadata (not needed by the container)
+.git/
+.gitignore
+.github/
+.multica/
+.agent_context/
+multica-delegation-*.md
+uv.lock
