@@ -14,6 +14,7 @@ from .analyzers.access_log import analyze_access_logs
 from .analyzers.cphulk_log import analyze_cphulk_logs
 from .analyzers.csf_state import analyze_csf_state
 from .analyzers.domlog_inventory import analyze_domlog_inventory
+from .analyzers.error_log import analyze_error_log
 from .analyzers.modsec_log import analyze_modsec_and_errors
 from .analyzers.secure_log import analyze_secure_logs
 from .analyzers.ssh_hardening import analyze_ssh_config
@@ -180,12 +181,29 @@ def run_analyzers(cfg: Config, fs: FileSystem) -> list[Finding]:
     if apache_warn is not None:
         findings.append(apache_warn)
 
+    # AISO-201: detect the host's own IPs so self-logins (cron /
+    # monitoring / internal services) don't trip brute-force findings.
+    # The operator can extend the set via `modules.secure_log.trusted_ips`.
+    # AISO-211: the same set is now also passed into the access_log
+    # analyzer so cPanel self-admin-panel noise doesn't drown the
+    # per-IP rollups. Detection runs early so both consumers see the
+    # same set without a second DNS round-trip.
+    operator_trusted = list(cfg.modules.get("secure_log", {}).get("trusted_ips", []) or [])
+    self_ips = detect_self_ips(operator_trusted)
+    _LOG.debug("self-IP set for self-login filter: %s", sorted(self_ips))
+
     access_paths = _effective_access_paths(cfg, fs)
     _LOG.info("access_log candidate paths: %s", access_paths)
+    # AISO-211: pass the host's own IPs into the access_log analyzer
+    # so cPanel self-admin-panel noise doesn't drown the per-IP
+    # rollups (`top_attackers`, `host_errors_top`, `top_hosts`).
+    # The orchestrator gates this on `modules.access_log.exclude_self_ips`
+    # (default True); flip to False for diagnostic mode.
     findings.extend(analyze_access_logs(
         access_paths,
         fs,
         rules=cfg.modules.get("access_log", {}),
+        self_ips=self_ips,
     ))
 
     findings.extend(analyze_domlog_inventory(
@@ -204,12 +222,20 @@ def run_analyzers(cfg: Config, fs: FileSystem) -> list[Finding]:
         rules=cfg.modules.get("modsec_log", {}),
     ))
 
-    # AISO-201: detect the host's own IPs so self-logins (cron /
-    # monitoring / internal services) don't trip brute-force findings.
-    # The operator can extend the set via `modules.secure_log.trusted_ips`.
-    operator_trusted = list(cfg.modules.get("secure_log", {}).get("trusted_ips", []) or [])
-    self_ips = detect_self_ips(operator_trusted)
-    _LOG.debug("self-IP set for self-login filter: %s", sorted(self_ips))
+    # AISO-211: the new Apache ``error_log`` analyzer. Reads the
+    # same paths the modsec analyzer already used for the error_log
+    # *file presence* check (the INFO finding in
+    # ``analyze_modsec_and_errors`` lists the file but drops the
+    # contents). The new analyzer is OPT-IN via
+    # ``modules.error_log.enabled`` — default OFF so the audit scope
+    # stays unchanged for hosts that don't have the file or
+    # operators who haven't opted in.
+    if cfg.modules.get("error_log", {}).get("enabled", False):
+        findings.extend(analyze_error_log(
+            error_paths,
+            fs,
+            rules=cfg.modules.get("error_log", {}),
+        ))
 
     # Quick-win analyzers (GAPS §4). Each is bounded: the analyzer
     # emits its own INFO finding when no files match. We do NOT

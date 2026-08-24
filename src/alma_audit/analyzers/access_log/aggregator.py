@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from typing import Any
 
+from ...self_ip import is_self_ip
 from .parser import AccessRecord
 
 
@@ -140,12 +141,28 @@ class AccessAggregator:
     lift or tighten it from the YAML config (AISO-207 contract).
     """
 
-    def __init__(self, ip_user_agent_cap: int = 5) -> None:
+    def __init__(
+        self,
+        ip_user_agent_cap: int = 5,
+        self_ips: set[str] | None = None,
+    ) -> None:
         # 0/5/10/N all bound the per-IP rollup at N distinct UAs.
         # A negative value disables the cap (operator opts into the
         # unbounded, O(n²)-on-UA-diverse-traffic behaviour — measured
         # at 7.4s for 40k records / single IP).
         self.ip_user_agent_cap = ip_user_agent_cap
+        # AISO-211: the host's own IPs (auto-detected + operator
+        # allowlist). Self-IP records are STILL counted in
+        # ``hosts``, ``bytes_total``, ``status_buckets``,
+        # ``method_buckets`` (the overall counters stay accurate),
+        # but they are NOT counted in ``top_attackers``,
+        # ``host_errors_top`` or the ``top_hosts`` aggregator slice.
+        # Forensic dump records them in ``self_ip_event_count`` /
+        # ``self_ip_examples`` so the operator can audit self-noise.
+        # A cPanel server is going to log hundreds of self-login /
+        # admin-panel fetches from the host's own daemon — surfacing
+        # them in the top-N would drown the operator in noise.
+        self.self_ips: set[str] = self_ips or set()
         self.hosts: Counter[str] = Counter()
         self.paths: Counter[str] = Counter()
         self.methods: Counter[str] = Counter()
@@ -175,42 +192,64 @@ class AccessAggregator:
         self.ip_user_agents: dict[str, list[str]] = defaultdict(list)
         # Status-by-host for per-host error breakdown (used by D4 details).
         self.status_by_host: dict[str, Counter[int]] = defaultdict(Counter)
+        # AISO-211: self-IP diagnostic counters. Surfaced in the
+        # forensic JSON dump so the operator can audit self-noise.
+        self.self_ip_event_count: int = 0
+        self.self_ip_examples: list[str] = []
 
     def add(self, record: AccessRecord) -> None:
         self.total_lines += 1
-        self.hosts[record.host] += 1
+        ip = record.host
+        is_self = is_self_ip(ip, self.self_ips)
+        if is_self:
+            # AISO-211: record the event for forensic dump (capped at
+            # 5 samples so the JSON stays bounded), but skip the
+            # per-IP / per-(path, ip) rollups that drive the
+            # operator-eye top-N views.
+            self.self_ip_event_count += 1
+            if len(self.self_ip_examples) < 5:
+                self.self_ip_examples.append(
+                    f"{record.method} {record.path} from {ip} (self-IP)"
+                )
+        # Overall counters: ALWAYS include self-IP traffic so the
+        # operator's "how many lines did the audit scan?" / "how many
+        # bytes came through?" views stay honest.
+        self.hosts[ip] += 1
         self.paths[record.path] += 1
         self.methods[record.method] += 1
         self.status_buckets[record.status] += 1
-        self.status_by_host[record.host][record.status] += 1
+        self.status_by_host[ip][record.status] += 1
         self.bytes_total += record.size
-        self.bytes_by_host[record.host] += record.size
+        self.bytes_by_host[ip] += record.size
         if record.user_agent:
-            self.last_ua_by_host[record.host] = record.user_agent
-            # AISO-208 review fix #2: the per-IP rollup has a bounded
-            # UA window (default 5). The bound is purely cosmetic at
-            # this layer — the forensic view in ``probe_by_path_ip``
-            # is unbounded — but without it the rollup allocates an
-            # O(distinct-UAs) list per host and the membership check
-            # becomes O(n²) across the whole log. The cap is plumbed
-            # through the constructor so the YAML config can lift /
-            # tighten it per deployment (AISO-207 contract).
-            #
-            # Sentinel: ``ip_user_agent_cap < 0`` disables the cap
-            # and falls through to ``append`` for every distinct UA.
-            ua_list = self.ip_user_agents[record.host]
-            new_ua = record.user_agent not in ua_list
-            if new_ua and (self.ip_user_agent_cap < 0 or len(ua_list) < self.ip_user_agent_cap):
-                ua_list.append(record.user_agent)
+            # AISO-211: skip UA tracking for self-IPs. A cPanel
+            # admin-panel request from 127.0.0.1 has no UA worth
+            # keeping in the per-IP rollup — it would just inflate
+            # the forensic view of the host's own daemon.
+            if not is_self:
+                self.last_ua_by_host[ip] = record.user_agent
+                ua_list = self.ip_user_agents[ip]
+                new_ua = record.user_agent not in ua_list
+                if new_ua and (self.ip_user_agent_cap < 0 or len(ua_list) < self.ip_user_agent_cap):
+                    ua_list.append(record.user_agent)
 
         # First/last seen per host (string comparison works for ISO-style
-        # Apache timestamps like "10/Oct/2025:13:55:36 -0700").
-        ip = record.host
+        # Apache timestamps like "10/Oct/2025:13:55:36 -0700"). Self-IPs
+        # keep their own timestamps so the diagnostic dump is honest.
         ts = record.timestamp
         if ip not in self.ip_first_seen or (ts and ts < self.ip_first_seen[ip]):
             self.ip_first_seen[ip] = ts
         if ip not in self.ip_last_seen or (ts and ts > self.ip_last_seen[ip]):
             self.ip_last_seen[ip] = ts
+
+        if is_self:
+            # AISO-211: stop here for self-IP records. They are NOT
+            # counted in the probe-path rollups (`probe_hits`,
+            # `probe_by_path_ip`, `probe_total_by_ip`) — a localhost
+            # hit on `/.env` is a self-admin-panel fetch, not a
+            # scanner event. The diagnostic counter above keeps the
+            # event visible for forensics.
+            return
 
         for pattern in SUSPICIOUS_PATH_PATTERNS:
             if pattern in record.path:
@@ -227,6 +266,14 @@ class AccessAggregator:
                 break  # one pattern per record is enough
 
     def finalize(self) -> dict[str, Any]:
+        # AISO-211: self-IP set (may be empty). Used to filter the
+        # per-IP rollups below so the operator-eye top-N views don't
+        # get drowned by cPanel self-admin-panel noise.
+        self_ips = self.self_ips
+
+        def _is_self(ip: str) -> bool:
+            return is_self_ip(ip, self_ips)
+
         # probe_paths_by_ip: { path -> [ {ip, count, first_seen, last_seen,
         #                                 user_agents, user_agent_counts}, ... ] }
         # `user_agents` is the insertion-ordered distinct-UA list
@@ -234,7 +281,9 @@ class AccessAggregator:
         # want the names); `user_agent_counts` is the per-UA hit
         # counts — the source of truth for any "path × IP × UA"
         # breakdown (AISO-208 review fix). Sorted by count desc so the
-        # operator's-eye view is "top offenders first".
+        # operator's-eye view is "top offenders first". AISO-211:
+        # self-IP rows are excluded — the aggregator's `add()` already
+        # skips them, so this is a defense-in-depth check.
         probe_paths_by_ip: dict[str, list[dict[str, Any]]] = {}
         for path, ip_map in self.probe_by_path_ip.items():
             rows = [
@@ -244,25 +293,28 @@ class AccessAggregator:
                     "first_seen": stat.first_seen,
                     "last_seen": stat.last_seen,
                     "user_agents": list(stat.user_agents),
-                    # Per-UA counts — the AISO-208 review fix added
-                    # this field so the forensic JSON carries the
-                    # exact breakdown instead of a fabricated even
-                    # split. ``stat.ua_counts`` is a Counter[str];
-                    # ``dict(...)`` produces a JSON-safe plain dict.
                     "user_agent_counts": dict(stat.ua_counts),
                 }
                 for ip, stat in ip_map.items()
+                if not _is_self(ip)
             ]
+            if not rows:
+                continue
             rows.sort(key=lambda r: r["count"], reverse=True)
             probe_paths_by_ip[path] = rows
 
         # top_attackers: [ {ip, total_probe_count, probe_paths, first_seen, last_seen, user_agents}, ... ]
+        # AISO-211: skip self-IP entries (the aggregator's add() already
+        # excludes them from probe_total_by_ip, so this is also a
+        # defense-in-depth check on the iteration path).
         attacker_rows: list[dict[str, Any]] = []
         for ip, probe_count in self.probe_total_by_ip.items():
+            if _is_self(ip):
+                continue
             # Per-attacker path breakdown (paths -> counts).
             paths: dict[str, int] = {}
             for path, ip_map in self.probe_by_path_ip.items():
-                if ip in ip_map:
+                if ip in ip_map and not _is_self(ip):
                     paths[path] = ip_map[ip].count
             attacker_rows.append({
                 "ip": ip,
@@ -277,14 +329,16 @@ class AccessAggregator:
         attacker_rows.sort(key=lambda r: r["total_probe_requests"], reverse=True)
 
         # Per-host error breakdown — top 4xx/5xx contributors.
-        # Sorted by error count desc, capped at top 20 hosts to keep the
-        # report scannable (per the user's preference for lean output).
+        # AISO-211: exclude self-IPs from the operator-eye rollup.
+        # The forensic JSON keeps the unfiltered status_by_host map;
+        # the rules layer can split internal vs external from there.
         host_error_rows: list[dict[str, Any]] = []
+        host_error_rows_internal: list[dict[str, Any]] = []
         for host, status_counter in self.status_by_host.items():
             err_count = sum(c for code, c in status_counter.items() if 400 <= code < 600)
             if err_count == 0:
                 continue
-            host_error_rows.append({
+            row = {
                 "ip": host,
                 "error_count": err_count,
                 "total_requests": self.hosts.get(host, 0),
@@ -292,12 +346,29 @@ class AccessAggregator:
                 "status_buckets": {
                     str(code): count for code, count in sorted(status_counter.items())
                 },
-            })
+            }
+            if _is_self(host):
+                host_error_rows_internal.append(row)
+            else:
+                host_error_rows.append(row)
         host_error_rows.sort(key=lambda r: r["error_count"], reverse=True)
+        host_error_rows_internal.sort(key=lambda r: r["error_count"], reverse=True)
         # Cap at 20 to keep report size sane; the operator can grep the
-        # raw JSON for the rest if they want a full list.
+        # raw JSON for the rest if they want a full list. AISO-211:
+        # the internal split is also capped at 20 for symmetry.
         host_errors_top = host_error_rows[:20]
-        host_errors_total = len(host_error_rows)
+        host_errors_internal_top = host_error_rows_internal[:20]
+        host_errors_total = len(host_error_rows) + len(host_error_rows_internal)
+
+        # AISO-211: top_hosts rollup also strips self-IP. The
+        # operator's "who generated the most traffic?" view would
+        # otherwise surface 127.0.0.1 × 52041 as the #1 host on every
+        # cPanel server, drowning the real external traffic.
+        top_hosts_filtered = [
+            (ip, count)
+            for ip, count in self.hosts.most_common()
+            if not _is_self(ip)
+        ][:10]
 
         return {
             "total_lines": self.total_lines,
@@ -310,12 +381,18 @@ class AccessAggregator:
                 for code, count in sorted(self.status_buckets.items())
             },
             "method_buckets": dict(self.methods),
-            "top_hosts": self.hosts.most_common(10),
+            "top_hosts": top_hosts_filtered,
             "top_paths": self.paths.most_common(10),
             "probe_hits": self.probe_hits.most_common(),
             # AISO-197 forensic detail (full, no cap):
             "probe_paths_by_ip": probe_paths_by_ip,
             "top_attackers": attacker_rows,
             "host_errors_top": host_errors_top,
+            # AISO-211: self-IP rollup for forensic consumers.
+            "host_errors_internal_top": host_errors_internal_top,
             "host_errors_total": host_errors_total,
+            # AISO-211: self-IP diagnostic dump. Recorded for forensic
+            # consumers, not surfaced as a finding.
+            "self_ip_event_count": self.self_ip_event_count,
+            "self_ip_examples": list(self.self_ip_examples),
         }
