@@ -67,3 +67,24 @@ def test_load_accepts_unknown_keys(tmp_path):
     )
     cfg = load_config(str(cfg_file))
     assert cfg.modules == {}
+
+
+def test_default_ssl_cert_roots_excludes_os_trust_stores():
+    """The default `ssl_cert_roots` only includes the host cert directory.
+
+    OS-level CA trust stores (`/etc/pki/tls/certs`, `/etc/ssl/certs`)
+    must be excluded from the default — those directories contain
+    package-managed root CAs, not host-issued certs the operator
+    renews. Scanning them produces false-positive WARN findings on
+    AlmaLinux 8 / RHEL 8 hosts (the `ca-bundle.trust.crt` file is not
+    single-PEM and trips `cryptography`'s loader). Operators who need
+    to scan a custom path can override via `paths.ssl_cert_roots` in
+    YAML.
+
+    This test guards against accidental re-inclusion of those paths
+    in a future refactor.
+    """
+    cfg = load_config(None)
+    assert cfg.paths.ssl_cert_roots == ["/var/cpanel/ssl"]
+    assert "/etc/pki/tls/certs" not in cfg.paths.ssl_cert_roots
+    assert "/etc/ssl/certs" not in cfg.paths.ssl_cert_roots

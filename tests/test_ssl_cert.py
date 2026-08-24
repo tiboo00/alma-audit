@@ -13,6 +13,7 @@ from cryptography.x509.oid import NameOID
 from alma_audit.analyzers.ssl_cert import (
     CertAggregator,
     CertInfo,
+    SSL_CERT_GLOB_ROOTS,
     analyze_ssl_certs,
     cryptography_available,
     parse_pem_cert,
@@ -79,6 +80,18 @@ def _fs_with_bytes(files: dict[str, bytes]) -> FakeFileSystem:
 
 def test_cryptography_available_returns_true_when_installed():
     assert cryptography_available() is True
+
+
+def test_default_glob_roots_excludes_os_trust_stores():
+    """Anti-regression: `SSL_CERT_GLOB_ROOTS` only carries host cert dirs.
+
+    OS-level CA trust stores (`/etc/pki/tls/certs`, `/etc/ssl/certs`)
+    are deliberately excluded — see `ssl_cert/settings.py` for the
+    rationale. This test fails fast if a future refactor re-adds them.
+    """
+    assert SSL_CERT_GLOB_ROOTS == ["/var/cpanel/ssl"]
+    assert "/etc/pki/tls/certs" not in SSL_CERT_GLOB_ROOTS
+    assert "/etc/ssl/certs" not in SSL_CERT_GLOB_ROOTS
 
 
 def test_parse_pem_cert_returns_cert_info_for_valid_cert():

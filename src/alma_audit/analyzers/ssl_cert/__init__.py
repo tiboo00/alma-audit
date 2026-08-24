@@ -1,7 +1,7 @@
 """Public re-exports for the ssl_cert analyzer package.
 
 Parses PEM-encoded X.509 certificates under the configured glob roots
-(`/var/cpanel/ssl/*`, `/etc/pki/tls/certs/*`, etc.) and flags:
+(default: `/var/cpanel/ssl/*`) and flags:
 
   - **Expired certificates** (CRITICAL).
   - **Certificates expiring within `expiry_warn_days`** (WARN).

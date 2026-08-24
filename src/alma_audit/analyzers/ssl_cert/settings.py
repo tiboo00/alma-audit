@@ -28,8 +28,18 @@ DEFAULT_RULES: dict[str, Any] = {
 #
 # Operators can override via `paths.ssl_cert_glob` in the YAML config —
 # they append to or replace this list.
+#
+# Scope note: only the cPanel/host certificate root (`/var/cpanel/ssl`)
+# is checked by default. The OS-level CA trust stores
+# (`/etc/pki/tls/certs`, `/etc/ssl/certs`) are deliberately excluded:
+# those directories hold long-lived root CA certificates that the
+# package manager maintains — not host-issued certs that the operator
+# needs to renew. Scanning them produces false-positive WARN findings
+# on every AlmaLinux 8 / RHEL 8 host (the `ca-bundle.trust.crt` file
+# is not single-PEM and trips `cryptography`'s loader), and the
+# operator has no remediation path for those CAs anyway. Operators
+# who want to scan a custom path (e.g. their own internal CA bundle)
+# can append to this list via `paths.ssl_cert_glob` in YAML.
 SSL_CERT_GLOB_ROOTS: list[str] = [
     "/var/cpanel/ssl",
-    "/etc/pki/tls/certs",
-    "/etc/ssl/certs",
 ]

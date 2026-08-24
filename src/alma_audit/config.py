@@ -60,10 +60,13 @@ class Paths:
     auth_log_glob: list[str] = field(default_factory=lambda: list(DEFAULT_AUTH_LOG_GLOB))
     cphulk_log_root: str = "/var/log"
     cphulk_log_glob: list[str] = field(default_factory=lambda: list(DEFAULT_CPHULK_LOG_GLOB))
+    # Host-issued cert roots only. OS-level CA trust stores
+    # (`/etc/pki/tls/certs`, `/etc/ssl/certs`) are deliberately excluded
+    # from the default — see `ssl_cert/settings.py` for the rationale
+    # (those dirs contain OS-managed root CAs, not host certs the
+    # operator renews). Override via `paths.ssl_cert_roots` in YAML.
     ssl_cert_roots: list[str] = field(default_factory=lambda: [
         "/var/cpanel/ssl",
-        "/etc/pki/tls/certs",
-        "/etc/ssl/certs",
     ])
     ssl_cert_glob: list[str] = field(default_factory=lambda: list(DEFAULT_SSL_CERT_GLOB))
     csf_deny_paths: list[str] = field(default_factory=lambda: [DEFAULT_CSF_DENY_PATH])
