@@ -314,9 +314,9 @@ but always "what new file does this belong in".
 | `analyzers/secure_log/settings.py` | 51 | 🟢 ok | thresholds + globs |
 | `analyzers/secure_log/analyzer.py` | 199 | 🟢 ok | orchestrator |
 | `analyzers/secure_log/__init__.py` | 45 | 🟢 ok | re-exports |
-| `analyzers/ssl_cert/parser.py` | 106 | 🟢 ok | X.509 PEM parser, optional `[ssl]` extra |
+| `analyzers/ssl_cert/parser.py` | 101 | 🟢 ok | X.509 PEM parser, optional `[ssl]` extra |
 | `analyzers/ssl_cert/aggregator.py` | 47 | 🟢 ok | thin aggregator |
-| `analyzers/ssl_cert/rules.py` | 123 | 🟢 ok | D12/D13 expiry + read-error rules |
+| `analyzers/ssl_cert/rules.py` | 122 | 🟢 ok | D12/D13 expiry + read-error rules |
 | `analyzers/ssl_cert/settings.py` | 34 | 🟢 ok | thresholds + cert roots |
 | `analyzers/ssl_cert/analyzer.py` | 255 | 🟢 ok | orchestrator |
 | `analyzers/ssl_cert/__init__.py` | 45 | 🟢 ok | re-exports |
@@ -327,9 +327,9 @@ but always "what new file does this belong in".
 | `analyzers/cphulk_log/analyzer.py` | 168 | 🟢 ok | orchestrator |
 | `analyzers/cphulk_log/__init__.py` | 46 | 🟢 ok | re-exports |
 | `analyzers/csf_state.py` | 376 | 🟢 ok | single-purpose flat module (AISO-186) |
-| `runners.py` | 284 | 🟢 ok | single responsibility (file-glob runner + injected FS + read_bytes) |
+| `runners.py` | 349 | 🟢 ok | single responsibility (file-glob runner + injected FS + read_bytes); grew from 284 after AISO-189 quick-win wiring — still well under the 1000-line ceiling |
 | `runner.py` | 239 | 🟢 ok | orchestration only; no detection logic |
-| `cli.py` | 134 | 🟢 ok | argparse + entry; nothing to split |
+| `cli.py` | 133 | 🟢 ok | argparse + entry; nothing to split |
 | `config.py` | 158 | 🟢 ok | YAML loader + defaults + new quick-win root paths |
 | `ip_normalise.py` | 105 | 🟢 ok | pure utility; do not grow |
 | `reporting.py` | 94 | 🟢 ok | two writers; could split `json_writer.py` / `md_writer.py` if it grows |
