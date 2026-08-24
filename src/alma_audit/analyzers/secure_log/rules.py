@@ -3,8 +3,9 @@
 Four rules, each emitting zero or more `Finding` records:
 
   D8 — SSH brute-force burst (per source IP). WARN/CRITICAL based on
-       the number of failed-password lines for that IP across the
-       scan window. NEVER crawler-suppressible (no crawler layer here).
+       the combined number of `ssh_fail` AND `ssh_invalid_user` lines
+       for that IP across the scan window. NEVER crawler-suppressible
+       (no crawler layer here).
   D9 — sudo authentication failure burst (per user). WARN/CRITICAL
        based on the number of `pam_unix(sudo:auth): authentication
        failure` lines for that user.
@@ -17,6 +18,13 @@ Four rules, each emitting zero or more `Finding` records:
 The crawler-suppressibility distinction does NOT apply to secure_log —
 the §6.1 chain is access_log-scoped. Operators reading the report
 still get the `crawler_suppression: n/a` sentinel for shape parity.
+
+AISO-203: D8 combines the per-IP `ssh_fail_by_ip` (single-account
+credential stuffing) and `ssh_invalid_user_by_ip` (rotating-username
+enumeration) counters into a single brute-force total per IP, so an
+attacker that only rotates usernames still trips D8. The two
+underlying counters stay separate in the aggregator / forensic JSON
+so the operator can tell which attack pattern they are seeing.
 """
 
 from __future__ import annotations
@@ -32,30 +40,58 @@ def rule_ssh_brute_force(
     agg: SecureAggregator,
     settings: dict[str, Any],
 ) -> list[Finding]:
-    """D8 — SSH failed-password burst per source IP."""
+    """D8 — SSH failed-password burst per source IP.
+
+    AISO-203: combine `ssh_fail_by_ip` (single-account credential
+    stuffing) with `ssh_invalid_user_by_ip` (rotating-username
+    enumeration) into a per-IP brute-force total. An attacker that
+    ONLY rotates usernames (and never hits a known account) still
+    trips the rule. The aggregator keeps the two counters separate
+    so the operator can tell which attack pattern they are seeing
+    in the report's `details`.
+    """
     n_a = CrawlerSuppression.not_applicable().to_dict()
     findings: list[Finding] = []
-    if not agg.ssh_fail_by_ip:
+    # AISO-203: union of all IPs across both attack-pattern counters.
+    all_ips = set(agg.ssh_fail_by_ip) | set(agg.ssh_invalid_user_by_ip)
+    if not all_ips:
         return findings
-    for ip, count in agg.ssh_fail_by_ip.most_common():
-        if count >= settings["ssh_fail_crit"]:
+    # Pre-compute the per-IP totals and sort by combined count desc.
+    combined: list[tuple[str, int, int]] = []
+    for ip in all_ips:
+        fail_count = agg.ssh_fail_by_ip.get(ip, 0)
+        invalid_count = agg.ssh_invalid_user_by_ip.get(ip, 0)
+        combined.append((ip, fail_count, invalid_count))
+    combined.sort(key=lambda t: (t[1] + t[2]), reverse=True)
+    for ip, fail_count, invalid_count in combined:
+        total = fail_count + invalid_count
+        if total >= settings["ssh_fail_crit"]:
             sev = Severity.CRITICAL
-        elif count >= settings["ssh_fail_warn"]:
+        elif total >= settings["ssh_fail_warn"]:
             sev = Severity.WARN
         else:
             continue
         findings.append(Finding(
             module="secure_log",
             severity=sev,
-            title=f"SSH brute-force from {ip}: {count} failed attempt(s)",
+            title=f"SSH brute-force from {ip}: {total} failed attempt(s)",
             description=(
-                f"Source IP {ip!r} produced {count} failed SSH "
-                "authentication(s) in the scan window. Consistent with a "
-                "credential-stuffing attempt against the host."
+                f"Source IP {ip!r} produced {total} failed SSH "
+                "authentication(s) in the scan window. "
+                f"Breakdown: {fail_count} known-account "
+                f"credential-stuffing attempt(s) and "
+                f"{invalid_count} rotating-username "
+                f"enumeration attempt(s). "
+                "Consistent with a brute-force campaign against the host."
             ),
             details={
                 "source_ip": ip,
-                "fail_count": count,
+                "fail_count": total,
+                # AISO-203: surface the per-pattern split so the
+                # operator can distinguish credential stuffing from
+                # username enumeration at a glance.
+                "ssh_fail_count": fail_count,
+                "ssh_invalid_user_count": invalid_count,
                 "crawler_suppression": n_a,
             },
             recommendation=(

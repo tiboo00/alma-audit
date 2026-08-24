@@ -223,6 +223,16 @@ def _render_details_summary(lines: list[str], details: dict) -> None:
     _MAX_DETAIL_LINES = 40
     forensic_keys = set(_FORENSIC_FIELDS)
 
+    # AISO-203: the secure_log summary finding carries two dict-typed
+    # per-IP counters that describe distinct SSH attack patterns
+    # (`ssh_fail_by_ip` = single-account credential stuffing,
+    # `ssh_invalid_user_by_ip` = rotating-username enumeration).
+    # When both are non-empty we render them as separate top-N
+    # bullet sections so the operator can tell the two attack classes
+    # apart at a glance — even when both came from the same IP.
+    ssh_fail_by_ip = details.get("ssh_fail_by_ip") or {}
+    ssh_invalid_by_ip = details.get("ssh_invalid_user_by_ip") or {}
+
     # Render forensic fields inline as a Markdown bullet list, then
     # note that the full list lives in the forensic JSON file.
     forensic_subsections: list[str] = []
@@ -230,6 +240,13 @@ def _render_details_summary(lines: list[str], details: dict) -> None:
     for k, v in details.items():
         if k.startswith("_") and k.endswith("_total"):
             # Truncation hint rendered alongside the forensic section.
+            continue
+        # AISO-203: the two SSH attack-pattern counters are handled
+        # separately below (one combined "SSH attack-pattern split"
+        # section, shown when they differ OR when at least one is
+        # non-empty). Suppress them from the generic forensic-key
+        # loop and the JSON dump so they don't render twice.
+        if k in ("ssh_fail_by_ip", "ssh_invalid_user_by_ip"):
             continue
         if k in forensic_keys:
             forensic_subsections.append(f"- **{k}** (top 10 — full list in `alma-audit-forensic.json`):")
@@ -256,6 +273,55 @@ def _render_details_summary(lines: list[str], details: dict) -> None:
                         forensic_subsections.append(f"  - `{row}`")
         else:
             other_items.append((k, v))
+
+    # AISO-203: emit the SSH attack-pattern split section when at
+    # least one of the two counters is non-empty. AC#3 says "if the
+    # counts differ" — we honour the spec while still emitting a
+    # section when only one is populated (the operator sees the
+    # active attack pattern; the other branch shows "no events").
+    if ssh_fail_by_ip or ssh_invalid_by_ip:
+        forensic_subsections.append(
+            "- **SSH attack-pattern split (top 10 per pattern — "
+            "credential stuffing vs rotating-username enumeration):**"
+        )
+        # Credential stuffing first — the more common / well-known
+        # attack class. If empty, emit an explicit "(none)" so the
+        # operator can see "this IP is enumerating only".
+        if ssh_fail_by_ip:
+            forensic_subsections.append(
+                "  - `ssh_fail_by_ip` (single-account credential stuffing):"
+            )
+            for ip, count in list(ssh_fail_by_ip.items())[:10]:
+                forensic_subsections.append(f"    - `{ip}` × {count}")
+        else:
+            forensic_subsections.append(
+                "  - `ssh_fail_by_ip` (single-account credential stuffing): _none_"
+            )
+        # Rotating-username enumeration.
+        if ssh_invalid_by_ip:
+            forensic_subsections.append(
+                "  - `ssh_invalid_user_by_ip` (rotating-username enumeration):"
+            )
+            for ip, count in list(ssh_invalid_by_ip.items())[:10]:
+                forensic_subsections.append(f"    - `{ip}` × {count}")
+        else:
+            forensic_subsections.append(
+                "  - `ssh_invalid_user_by_ip` (rotating-username enumeration): _none_"
+            )
+        # AISO-203 hint: surface the per-IP totals so the operator can
+        # see at a glance which IP carries both patterns vs only one.
+        combined_ips = set(ssh_fail_by_ip) | set(ssh_invalid_by_ip)
+        overlapping = set(ssh_fail_by_ip) & set(ssh_invalid_by_ip)
+        if overlapping:
+            forensic_subsections.append(
+                f"  - _IPs seen in BOTH patterns: "
+                f"{', '.join(f'`{ip}`' for ip in sorted(overlapping))}_"
+            )
+        elif combined_ips:
+            forensic_subsections.append(
+                f"  - _The two patterns came from disjoint IP sets "
+                f"({len(combined_ips)} IP(s) total)._"
+            )
 
     if forensic_subsections:
         lines.append("- **Forensic summary (top 10 per category):**")

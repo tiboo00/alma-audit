@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-WORK="$(cd "$(dirname "$0")/.." && pwd)"
+WORK="$(cd "$(dirname "$0")" && pwd)"
 cd "$WORK"
 
 PASS=0
@@ -53,7 +53,7 @@ check "AISO-202 (chunking) — test_cloudflare_payloads_chunk_above_threshold ex
 check "AISO-203 (SSH split) — ssh_invalid_user_by_ip counter in aggregator" \
     "grep -q 'ssh_invalid_user_by_ip' src/alma_audit/analyzers/secure_log/aggregator.py"
 check "AISO-203 (SSH split) — finalize emits ssh_invalid_user_by_ip" \
-    "grep -q 'ssh_invalid_user_by_ip' src/alma_audit/analyzers/secure_log/aggregator.py | head -1"
+    "grep -q '\"ssh_invalid_user_by_ip\"' src/alma_audit/analyzers/secure_log/aggregator.py"
 
 # AISO-204: Bandwidth anomaly detection.
 check "AISO-204 (bandwidth) — rule_bandwidth_hog exists in rules.py" \

@@ -132,10 +132,17 @@ def test_aggregator_counts_classified_lines_and_malformed():
     summary = agg.finalize()
     assert summary["classified_lines"] >= 9
     assert summary["malformed_lines"] == 1  # the cron line
-    # 1.2.3.4 had 2 fails (invalid-user + root). The aggregator
-    # counts each `Failed password` line as one event — that is 2.
+    # AISO-203: `ssh_fail` events from 1.2.3.4 are 2 — the parser
+    # counts each `Failed password` line as one event. The aggregator
+    # used to lump `ssh_invalid_user` into `ssh_fail_by_ip`; after
+    # the split, ONLY `ssh_fail` events count there.
     assert summary["ssh_fail_by_ip"]["1.2.3.4"] == 2
     assert summary["ssh_fail_by_ip"]["5.6.7.8"] == 1
+    # AISO-203: 9.10.11.12 only emitted `Invalid user evil` (one
+    # line) — it goes into `ssh_invalid_user_by_ip`, NOT into
+    # `ssh_fail_by_ip`.
+    assert summary["ssh_fail_by_ip"].get("9.10.11.12", 0) == 0
+    assert summary["ssh_invalid_user_by_ip"]["9.10.11.12"] == 1
     # `root` is the most-tried username (2x across the three failure
     # lines), `admin` is second. The fixture intentionally mixes
     # `Failed password for root` and `Failed password for invalid user root`
@@ -144,13 +151,95 @@ def test_aggregator_counts_classified_lines_and_malformed():
     assert summary["ssh_invalid_users_top"][1][0] == "admin"
 
 
-def test_aggregator_invalid_user_contributes_to_brute_force():
-    """`Invalid user X from Y` should also bump the per-IP burst counter."""
+def test_aggregator_invalid_user_contributes_to_separate_counter():
+    """AISO-203: `Invalid user X from Y` goes into `ssh_invalid_user_by_ip`,
+    NOT `ssh_fail_by_ip` (rotating-username enumeration is a distinct
+    attack class from single-account credential stuffing). The rule
+    layer still combines both for the brute-force *finding*, so an
+    attacker that only rotates usernames still trips D8.
+    """
     agg = SecureAggregator()
     for _ in range(5):
         rec = parse_line("Aug 17 04:12:34 host sshd[1234]: Invalid user evil from 9.10.11.12")
         agg.add(rec)
-    assert agg.ssh_fail_by_ip["9.10.11.12"] == 5
+    # ssh_invalid_user_by_ip takes the invalid-user burst.
+    assert agg.ssh_invalid_user_by_ip["9.10.11.12"] == 5
+    # ssh_fail_by_ip stays empty for that IP.
+    assert agg.ssh_fail_by_ip.get("9.10.11.12", 0) == 0
+
+
+def test_aggregator_split_counters_same_ip_separately():
+    """AISO-203 AC#4: same IP emits 5 `ssh_fail` + 5 `ssh_invalid_user`.
+    Each counter tracks ONLY its own pattern — no carry-over between
+    them. This is the regression test for the original bug where
+    `ssh_invalid_user` was silently folded into `ssh_fail_by_ip`.
+    """
+    agg = SecureAggregator()
+    # 5 `Failed password for root from 1.2.3.4` → ssh_fail_by_ip.
+    for _ in range(5):
+        agg.add(parse_line(
+            "Aug 17 04:12:34 host sshd[1234]: "
+            "Failed password for root from 1.2.3.4 port 12345 ssh2"
+        ))
+    # 5 `Invalid user ghost from 1.2.3.4` → ssh_invalid_user_by_ip.
+    for _ in range(5):
+        agg.add(parse_line(
+            "Aug 17 04:12:34 host sshd[1234]: Invalid user ghost from 1.2.3.4"
+        ))
+    summary = agg.finalize()
+    # Same IP in both counters, with the exact per-pattern counts.
+    assert summary["ssh_fail_by_ip"] == {"1.2.3.4": 5}
+    assert summary["ssh_invalid_user_by_ip"] == {"1.2.3.4": 5}
+    # Total forensic detail: 2 entries (one per (ip, user) bucket) —
+    # `ssh_fail_by_ip_user` keys by user, so 1.2.3.4 has one entry
+    # per distinct attempted username (root + ghost).
+    assert len(summary["ssh_fail_details"]) == 2
+    users = sorted(d["user"] for d in summary["ssh_fail_details"])
+    assert users == ["ghost", "root"]
+
+
+def test_aggregator_invalid_user_only_no_carry_to_fail_counter():
+    """AISO-203 AC#5: feed only `ssh_invalid_user` events. The new
+    `ssh_invalid_user_by_ip` counter is populated; `ssh_fail_by_ip`
+    stays empty for that IP — no carry-over between the two.
+    """
+    agg = SecureAggregator()
+    for _ in range(3):
+        agg.add(parse_line(
+            "Aug 17 04:12:34 host sshd[1234]: Invalid user ghostuser from 7.7.7.7"
+        ))
+    summary = agg.finalize()
+    assert summary["ssh_invalid_user_by_ip"] == {"7.7.7.7": 3}
+    assert summary["ssh_fail_by_ip"] == {}
+    # Forensic detail still records the invalid-user events.
+    assert len(summary["ssh_fail_details"]) == 1
+    assert summary["ssh_fail_details"][0]["ip"] == "7.7.7.7"
+    assert summary["ssh_fail_details"][0]["user"] == "ghostuser"
+
+
+def test_aggregator_invalid_user_only_still_triggers_brute_force_rule():
+    """AISO-203: D8 combines the two counters for the brute-force
+    *finding*, so an attacker that ONLY rotates usernames still
+    trips D8 with a sane threshold.
+    """
+    from alma_audit.analyzers.secure_log.rules import rule_ssh_brute_force
+
+    agg = SecureAggregator()
+    for _ in range(5):
+        agg.add(parse_line(
+            "Aug 17 04:12:34 host sshd[1234]: Invalid user ghostuser from 7.7.7.7"
+        ))
+    findings = rule_ssh_brute_force(agg, settings={
+        "ssh_fail_warn": 5, "ssh_fail_crit": 50,
+    })
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.severity == Severity.WARN
+    # The finding surfaces the per-pattern split in its details.
+    assert f.details["source_ip"] == "7.7.7.7"
+    assert f.details["ssh_fail_count"] == 0
+    assert f.details["ssh_invalid_user_count"] == 5
+    assert f.details["fail_count"] == 5
 
 
 def test_aggregator_useradd_uid_zero_is_separate():

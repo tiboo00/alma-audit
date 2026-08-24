@@ -5,7 +5,18 @@ per-line data. The detection rules in `rules.py` read this state to
 emit findings.
 
 Counts tracked:
-  - SSH failed-password bursts per source IP
+  - SSH failed-password bursts per source IP (`ssh_fail_by_ip`)
+  - SSH invalid-user (rotating-username) bursts per source IP
+    (`ssh_invalid_user_by_ip`) — kept SEPARATE because these two
+    patterns describe distinct attack classes:
+      * `ssh_fail` (`Failed password for known_user from IP`) is
+        single-user credential stuffing against a valid account.
+      * `ssh_invalid_user` (`Invalid user ghost from IP`) is
+        rotating-username enumeration — the scanner rotates names
+        because it doesn't know which accounts exist.
+    The rule layer combines both for the brute-force *finding*; the
+    aggregator tracks them in distinct counters so the operator can
+    tell which pattern they are seeing.
   - sudo authentication failure bursts per user
   - new-user creations (useradd) with their UID/GID for the rules
     layer to escalate UID=0 to CRITICAL
@@ -65,8 +76,14 @@ class SecureAggregator:
         # forensic JSON, but the brute-force counters skip them so a
         # cPanel self-login cron doesn't trip a CRITICAL finding.
         self.self_ips: set[str] = self_ips or set()
-        # SSH brute-force tracking.
+        # SSH brute-force tracking. AISO-203: ssh_invalid_user is a
+        # distinct attack class from ssh_fail (rotating-username
+        # enumeration vs single-account credential stuffing) — keep
+        # them in SEPARATE counters so the operator can tell which
+        # pattern they are seeing in the report. The rule layer
+        # combines both for the brute-force finding (see rules.py).
         self.ssh_fail_by_ip: Counter[str] = Counter()
+        self.ssh_invalid_user_by_ip: Counter[str] = Counter()
         self.ssh_invalid_users: list[str] = []
         self.ssh_accept_by_ip: Counter[str] = Counter()
         # sudo failure tracking.
@@ -110,6 +127,12 @@ class SecureAggregator:
             # AISO-201: skip self-IP in brute-force counter. Forensic
             # JSON still records the event so the operator can audit
             # their own cron / monitoring noise.
+            #
+            # AISO-203: ONLY `ssh_fail` events bump `ssh_fail_by_ip`.
+            # `ssh_invalid_user` events bump the SEPARATE
+            # `ssh_invalid_user_by_ip` counter so the operator can
+            # distinguish single-account credential stuffing from
+            # rotating-username enumeration.
             if is_self_ip(record.source_ip, self.self_ips):
                 self.self_ip_event_count += 1
                 if len(self.self_ip_examples) < 5:
@@ -122,10 +145,14 @@ class SecureAggregator:
                     self.ssh_invalid_users.append(record.user)
                 self._bump_ssh(record.source_ip, record.user, ts)
         elif record.event == "ssh_invalid_user" and record.source_ip:
-            # Treat `Invalid user X from Y` the same as a fail for the
-            # burst counter — the scanner has already tried to log in
-            # with a non-existent account. Without this distinction an
-            # attacker that rotates usernames wouldn't trip the rule.
+            # AISO-203: `Invalid user X from Y` is a SEPARATE attack
+            # class from `Failed password for known_user from Y`. It
+            # bumps `ssh_invalid_user_by_ip` only — NOT
+            # `ssh_fail_by_ip`. The rule layer combines both counters
+            # per (ip) for the brute-force finding, so an attacker
+            # that only rotates usernames still trips D8.
+            #
+            # AISO-201: still skip self-IPs (cron / monitoring noise).
             if is_self_ip(record.source_ip, self.self_ips):
                 self.self_ip_event_count += 1
                 if len(self.self_ip_examples) < 5:
@@ -133,7 +160,7 @@ class SecureAggregator:
                         f"ssh_invalid_user from {record.source_ip} (self-IP)"
                     )
             else:
-                self.ssh_fail_by_ip[record.source_ip] += 1
+                self.ssh_invalid_user_by_ip[record.source_ip] += 1
                 if record.user:
                     self.ssh_invalid_users.append(record.user)
                 self._bump_ssh(record.source_ip, record.user, ts)
@@ -207,6 +234,12 @@ class SecureAggregator:
             "classified_lines": self.classified_lines,
             "malformed_lines": self.malformed_lines,
             "ssh_fail_by_ip": dict(self.ssh_fail_by_ip.most_common(10)),
+            # AISO-203: separate counter for `ssh_invalid_user` (rotating-
+            # username enumeration). Empty when the scanner never
+            # tried non-existent accounts; populated alongside
+            # `ssh_fail_by_ip` when both attack patterns were observed
+            # from the same IP.
+            "ssh_invalid_user_by_ip": dict(self.ssh_invalid_user_by_ip.most_common(10)),
             "ssh_invalid_users_top": Counter(self.ssh_invalid_users).most_common(10),
             "ssh_accept_by_ip": dict(self.ssh_accept_by_ip.most_common(10)),
             "sudo_fail_by_user": dict(self.sudo_fail_by_user.most_common(10)),
