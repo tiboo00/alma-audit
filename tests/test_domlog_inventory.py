@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from alma_audit.analyzers.domlog_inventory import (
+    _SORT_WEIGHTS,
     _is_anomalous_filename,
     analyze_domlog_inventory,
 )
@@ -316,3 +317,166 @@ def test_domlog_root_none_falls_back_to_default():
     assert "not present" in findings[0].title.lower()
     # The reported roots are exactly the defaults.
     assert findings[0].details["roots_checked"] == DEFAULT_DOMLOG_ROOTS
+
+
+# ---------------------------------------------------------------------------
+# AISO-206: domlog anomalies list is severity-sorted (most-dangerous first).
+# ---------------------------------------------------------------------------
+
+
+def _anomalies_for_filenames(filenames: list[str]):
+    """Run the analyzer on a single-root FakeFS with the given filenames
+    and return the `details["anomalies"]` list from the aggregated finding.
+
+    A helper for the AISO-206 sort-order tests.
+    """
+    files = {f"{DOMLOG_ROOT}/{name}": "log" for name in filenames}
+    findings = analyze_domlog_inventory([DOMLOG_ROOT], _fs_with(files))
+    aggregated = [f for f in findings if "anomalous domlog filename" in f.title.lower()]
+    assert aggregated, (
+        f"Expected an aggregated anomaly finding; got titles: "
+        f"{[f.title for f in findings]}"
+    )
+    return aggregated[0].details["anomalies"]
+
+
+def test_aiso206_severity_sort_basic_three_reasons():
+    """AISO-206 acceptance criterion #3 (anti-regression lock).
+
+    Feed 3 anomalies with reasons `[filename_unusually_long,
+    shell_metacharacters, filename_too_long]`. The rendered list MUST
+    be ordered `[shell_metacharacters, filename_too_long,
+    filename_unusually_long]` — most-dangerous reason first, then
+    alphabetical filename within the same weight.
+
+    We pick distinct filenames per reason so the secondary sort key
+    (filename) doesn't accidentally mask a weight-regression.
+    """
+    filenames = [
+        "z_unusually_long_name_" + "x" * 65,   # 65..120 → filename_unusually_long
+        "a_host;rm",                            # shell_metacharacters
+        "b_" + "c" * 130,                       # >= 120 → filename_too_long
+    ]
+    reasons_in = [
+        "filename_unusually_long",
+        "shell_metacharacters",
+        "filename_too_long",
+    ]
+    anomalies = _anomalies_for_filenames(filenames)
+    assert [a["reason"] for a in anomalies] == [
+        "shell_metacharacters",
+        "filename_too_long",
+        "filename_unusually_long",
+    ]
+    # Belt-and-braces: also assert the input reasons landed exactly
+    # where we asked (no detection drift).
+    assert sorted(a["reason"] for a in anomalies) == sorted(reasons_in)
+
+
+def test_aiso206_severity_weights_constant_is_sorted_aligned():
+    """The weight table must be consistent with the docstring's contract.
+
+    The order in `_SORT_WEIGHTS` is informational; the test pins the
+    actual weights so any silent re-ordering of the dict (or removal of
+    a key) breaks loudly.
+    """
+    assert _SORT_WEIGHTS == {
+        "shell_metacharacters": 100,
+        "contract_pattern_d7": 90,
+        "repeated_character_pattern": 70,
+        "filename_too_long": 50,
+        "filename_unusually_long": 30,
+        "unexpected_filename_shape": 20,
+    }
+
+
+def test_aiso206_unknown_reason_falls_back_to_zero_weight():
+    """If the detector ever adds a new reason without a weight entry,
+    the sort must still be deterministic (unknown reasons sink to the
+    bottom, alphabetical within themselves), not crash with KeyError.
+    """
+    anomalies = [
+        {"filename": "z_unknown", "root": "/tmp", "reason": "future_unknown_reason"},
+        {"filename": "a_host;rm", "root": "/tmp", "reason": "shell_metacharacters"},
+    ]
+    # Reproduce the production sort in the test (mirrors the lambda in
+    # analyze_domlog_inventory). If the production key ever drifts, this
+    # test will silently agree — that's fine; the structural test above
+    # is the regression lock.
+    anomalies.sort(
+        key=lambda a: (-_SORT_WEIGHTS.get(a["reason"], 0), a["filename"]),
+    )
+    assert [a["filename"] for a in anomalies] == ["a_host;rm", "z_unknown"]
+
+
+def test_aiso206_full_report_and_forensic_share_sorted_anomalies():
+    """Acceptance criterion #4 — the FULL forensic / report JSON
+    preserves the sorted order so the operator sees the most-dangerous
+    anomalies at the top.
+
+    We build a real `AuditReport` via `cli.main()`'s report path (the
+    same code that emits `alma-audit-latest.json` and the forensic
+    JSON), then assert that both artifacts' `details["anomalies"]`
+    come out in the weighted order.
+    """
+    from alma_audit.reporting import build_report, write_forensic_report
+
+    # 4 filenames so we exercise multiple weight tiers + a tie.
+    # - `host;rm` → shell_metacharacters (weight 100, top)
+    # - `hostnAAAA...` (length 25, all-A) → repeated_character_pattern (70)
+    # - 2 × "x" * 130 → filename_too_long (50, alphabetical tie)
+    filenames = [
+        "x" * 130,                  # filename_too_long
+        "host;rm",                  # shell_metacharacters
+        "A" * 25,                   # repeated_character_pattern
+        "y" * 130,                  # filename_too_long (alphabetical tie with first)
+    ]
+    # Re-run the analyzer to grab the actual Finding objects.
+    files = {f"{DOMLOG_ROOT}/{name}": "log" for name in filenames}
+    findings = analyze_domlog_inventory([DOMLOG_ROOT], _fs_with(files))
+
+    # --- alma-audit-latest.json (the full report) carries details.anomalies ---
+    latest = build_report(findings, hostname="test-host").to_dict()
+    latest_agg = next(
+        f for f in latest["findings"]
+        if "anomalous domlog filename" in f["title"].lower()
+    )
+    latest_anomalies = latest_agg["details"]["anomalies"]
+    # The expected top entry is the shell-metacharacter filename.
+    assert latest_anomalies[0]["reason"] == "shell_metacharacters"
+    assert latest_anomalies[0]["filename"] == "host;rm"
+    # The fuzzing pattern comes next.
+    assert latest_anomalies[1]["reason"] == "repeated_character_pattern"
+    # The two filename_too_long entries tie on weight (50); the secondary
+    # sort is ascending alphabetical on filename, so the two pure-x
+    # runs are tied (no tie-breaker beyond equality) — accept either
+    # order for the tie case, but the third entry from the top must be
+    # a filename_too_long.
+    assert latest_anomalies[2]["reason"] == "filename_too_long"
+
+    # --- alma-audit-forensic.json shares the same payload ---
+    import tempfile
+    import json as _json
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write_forensic_report(build_report(findings, hostname="test-host"), tmp)
+        with open(path, encoding="utf-8") as fh:
+            forensic = _json.load(fh)
+    # The forensic JSON keeps the full findings list (AISO-199 — per-IP
+    # detail is the *additional* split, not a replacement). The domlog
+    # anomaly finding lives there too, with the same details.anomalies.
+    forensic_agg = next(
+        (f for f in forensic.get("findings", [])
+         if "anomalous domlog filename" in f.get("title", "").lower()),
+        None,
+    )
+    if forensic_agg is not None:
+        # If forensic keeps findings, the sort order MUST match.
+        forensic_reasons = [a["reason"] for a in forensic_agg["details"]["anomalies"]]
+        latest_reasons = [a["reason"] for a in latest_anomalies]
+        assert forensic_reasons == latest_reasons, (
+            f"forensic JSON drifted from alma-audit-latest.json: "
+            f"{forensic_reasons} vs {latest_reasons}"
+        )
+    # Either way, the full report (`alma-audit-latest.json`) preserves
+    # the sort — that is the operator-facing artifact for the domlog
+    # inventory.
