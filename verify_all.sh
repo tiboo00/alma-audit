@@ -233,6 +233,28 @@ check "AISO-209 (SSH hardening) — wired into runner.py" \
 check "AISO-209 (SSH hardening) — fixtures for weak / strong configs" \
     "test -f tests/fixtures/sshd_config_weak.conf -o -f tests/fixtures/sshd_config_strong.conf"
 
+# AISO-210: Finding-level fix-suggestion enrichment (multica 01a034d2-...)
+check "AISO-210 (fix-suggestions) — fix_suggestions module exists" \
+    "test -f src/alma_audit/fix_suggestions.py"
+check "AISO-210 (fix-suggestions) — FindingFix dataclass + FIX_LIBRARY" \
+    "grep -q 'class FindingFix' src/alma_audit/fix_suggestions.py && grep -q 'FIX_LIBRARY' src/alma_audit/fix_suggestions.py"
+check "AISO-210 (fix-suggestions) — fixes wired into the rendering" \
+    "grep -qE 'Recommended fixes|fixes\\[' src/alma_audit/reporting.py"
+check "AISO-210 (fix-suggestions) — weird_methods fix has Apache TraceEnable" \
+    "grep -q 'TraceEnable' src/alma_audit/fix_suggestions.py"
+check "AISO-210 (fix-suggestions) — --fix-format CLI flag exists" \
+    "grep -q -- '--fix-format' src/alma_audit/cli.py"
+
+# AISO-211: Self-IP filtering for access_log + new error_log analyzer (01a034d7-...)
+check "AISO-211 (self-IP) — AccessAggregator self_ips kwarg accepted" \
+    "grep -q 'self_ips' src/alma_audit/analyzers/access_log/aggregator.py"
+check "AISO-211 (self-IP) — top_attackers / host_errors_top strip self-IP" \
+    "grep -qE 'is_self_ip|self_ips' src/alma_audit/analyzers/access_log/aggregator.py"
+check "AISO-211 (error_rate) — error_rate_external field emitted" \
+    "grep -q 'error_rate_external' src/alma_audit/analyzers/access_log/rules.py"
+check "AISO-211 (error_log) — error_log analyzer package" \
+    "test -f src/alma_audit/analyzers/error_log/__init__.py"
+
 # ---------------------------------------------------------------------
 # 2. Test suite green — uses the resolved interpreter.
 # ---------------------------------------------------------------------
