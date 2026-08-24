@@ -30,6 +30,7 @@ from typing import Any
 from ...models import Finding, Severity
 from ..crawler_verify import CrawlerSuppression
 from .aggregator import SshdConfigSnapshot
+from .parser import SshdDirective
 from .settings import WEAK_CIPHERS, WEAK_MACS
 
 _NA = CrawlerSuppression.not_applicable().to_dict()
@@ -267,16 +268,56 @@ def rule_password_authentication(snap: SshdConfigSnapshot) -> list[Finding]:
 
 
 def rule_default_port(snap: SshdConfigSnapshot) -> list[Finding]:
-    d = _directive(snap, "Port")
-    if d is None or not d.values:
+    """WARN if any additive ``Port`` occurrence is the default 22.
+
+    ``Port`` is additive per ``sshd_config(5)``: sshd will listen on
+    every port listed, so ``Port 2222`` followed by ``Port 22`` binds
+    the daemon to BOTH ports. The previous implementation only
+    looked at the first-obtained value (the directive the snapshot
+    keeps under ``directives["port"]``) and missed every later
+    ``Port 22`` — a false negative against the acceptance criterion.
+
+    The rule scans every occurrence via
+    ``SshdConfigSnapshot.all_directives("Port")`` and emits a single
+    finding the first time it sees a parseable ``22``. The finding's
+    ``source_path`` / ``source_line`` come from the actual ``Port 22``
+    line (NOT from the first Port line, which may be a different
+    value); ``details.all_ports`` lists every observed port number
+    for operator context.
+    """
+    all_port_directives = snap.all_directives("port")
+    if not all_port_directives:
         return []
-    raw = d.values[0]
-    try:
-        port = int(raw)
-    except ValueError:
+    # Find the first Port 22 — its source metadata is what the
+    # operator needs to grep the original config. Earlier non-22
+    # values (e.g. ``Port 2222``) are still surfaced in
+    # ``details.all_ports`` for context.
+    target_directive: SshdDirective | None = None
+    for d in all_port_directives:
+        if not d.values:
+            continue
+        try:
+            if int(d.values[0]) == 22:
+                target_directive = d
+                break
+        except ValueError:
+            continue
+    if target_directive is None:
         return []
-    if port != 22:
-        return []
+
+    # Collect every parseable port number for the operator's
+    # context. Non-parseable values are silently skipped (sshd
+    # would error on them at runtime; the parser surfaces them
+    # under malformed_count already).
+    observed_ports: list[str] = []
+    for d in all_port_directives:
+        if d.values:
+            try:
+                int(d.values[0])
+                observed_ports.append(d.values[0])
+            except ValueError:
+                pass
+
     return [Finding(
         module="ssh_hardening",
         severity=Severity.WARN,
@@ -289,10 +330,11 @@ def rule_default_port(snap: SshdConfigSnapshot) -> list[Finding]:
             "magnitude."
         ),
         details={
-            "directive": d.keyword,
-            "value": raw,
-            "source_path": d.source_path,
-            "source_line": d.source_line,
+            "directive": target_directive.keyword,
+            "value": target_directive.values[0],
+            "all_ports": observed_ports,
+            "source_path": target_directive.source_path,
+            "source_line": target_directive.source_line,
             "crawler_suppression": _NA,
         },
         recommendation=(

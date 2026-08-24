@@ -41,8 +41,9 @@ from .parser import SshdDirective
 #     ListenAddress — "This keyword may appear multiple times in
 #     sshd_config with each instance appending to the list."
 # The aggregator keeps the *first* SshdDirective for each scalar
-# directive (first-obtained-wins) and APPENDS the values tuple for
-# every directive in this set.
+# directive (first-obtained-wins) and APPENDS every further
+# ``SshdDirective`` (with its full source metadata) for every
+# directive in this set.
 _ADDITIVE_DIRECTIVES: frozenset[str] = frozenset({
     "port",
     "acceptenv",
@@ -71,10 +72,30 @@ class SshdConfigSnapshot:
     """
 
     directives: dict[str, SshdDirective] = field(default_factory=dict)
-    # Additive directives carry every occurrence's values tuple in
-    # stream order. The first occurrence is still ``directives[key]``
-    # for source attribution; the additional occurrences live here.
-    directive_extras: dict[str, list[tuple[str, ...]]] = field(default_factory=dict)
+    # Additive directives carry every occurrence's FULL ``SshdDirective``
+    # record (not just the values tuple) in stream order. The first
+    # occurrence is still ``directives[key]`` for source attribution;
+    # the additional occurrences live here. The rule layer needs the
+    # source_path/source_line of the *non-first* occurrence too (e.g.
+    # ``Port 22`` appearing AFTER ``Port 2222``) — a bare values tuple
+    # would lose that.
+    directive_extras: dict[str, list[SshdDirective]] = field(default_factory=dict)
+
+    def all_directives(self, key: str) -> list[SshdDirective]:
+        """Return every observed ``SshdDirective`` for ``key`` in stream order.
+
+        For scalar (non-additive) directives this is a one-element list
+        containing the first-obtained directive. For additive directives
+        (``Port`` / ``AcceptEnv`` / ``AllowGroups`` / ``AllowUsers`` /
+        ``DenyGroups`` / ``DenyUsers`` / ``ListenAddress``) this is every
+        occurrence in stream order, so the rule layer can scan past the
+        first value without losing source metadata.
+        """
+        first = self.directives.get(key)
+        rest = self.directive_extras.get(key, [])
+        if first is None:
+            return list(rest)
+        return [first, *rest]
     raw_count: int = 0
     malformed_count: int = 0
     sources: list[str] = field(default_factory=list)
@@ -119,8 +140,14 @@ def apply_directive(snap: SshdConfigSnapshot, directive: SshdDirective) -> None:
         return
     # Subsequent occurrence.
     if key in _ADDITIVE_DIRECTIVES:
-        # Per the man-page note, additive directives accumulate.
-        snap.directive_extras[key].append(directive.values)
+        # Per the man-page note, additive directives accumulate. The
+        # FULL ``SshdDirective`` (not just the values tuple) is stored
+        # so the rule layer can attribute findings to the actual
+        # source line — critical for ``Port`` where ``Port 22`` may
+        # appear AFTER ``Port 2222`` and the operator needs the
+        # ``Port 22`` line, not the ``Port 2222`` line, in the
+        # finding's ``details.source_line``.
+        snap.directive_extras[key].append(directive)
         return
     # Scalar directive — first obtained value wins; later
     # occurrences are intentionally NOT reflected in the snapshot
