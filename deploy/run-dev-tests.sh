@@ -93,17 +93,31 @@ echo "[dev] python: $(python3.11 --version) ($(python3.11 -c 'import sys; print(
 # Runtime deps (PyYAML, cryptography, pytest) are pre-installed at
 # IMAGE BUILD TIME in Dockerfile.dev — no need to reinstall per run.
 #
-# `--no-build-isolation` reuses the system setuptools (already at
-# /usr/lib/python3.11/site-packages from the image build) instead of
-# creating an isolated build venv that would re-resolve setuptools
-# from PyPI. Without this flag, the editable install fails offline
-# (no PyPI access) with `Could not find a version that satisfies the
-# requirement setuptools>=61.0` — which broke verify_all.sh on
-# 2026-08-24 when its docker phase ran with `--network=none`. The
-# toolchain here is already pinned by the image, so build isolation
-# would only add an unnecessary network round-trip.
+# `--no-build-isolation` (CLI FLAG, not env var) reuses the system
+# setuptools (already at /usr/lib/python3.11/site-packages from the
+# image build) instead of creating an isolated build venv that would
+# re-resolve setuptools from PyPI. Without this flag, the editable
+# install fails offline (no PyPI access) with `Could not find a
+# version that satisfies the requirement setuptools>=61.0` — which
+# broke verify_all.sh on 2026-08-24 when its docker phase ran with
+# `--network=none`.
+#
+# Why CLI flag and not `PIP_NO_BUILD_ISOLATION=1` env var: pip 26.x
+# no longer honours the env var (only the CLI flag). Switching to
+# the flag is what lets `verify_all.sh` run its `docker run` with
+# `--network=none` and still pass. The toolchain here is already
+# pinned by the image, so build isolation would only add an
+# unnecessary network round-trip even when network IS available.
+#
+# Flag order matters: `--no-build-isolation` must precede `--editable`
+# in the argument list. pip stops parsing options at the first
+# positional argument that looks like a requirement spec; placing
+# `--no-build-isolation` after `--editable` makes pip treat it as a
+# project requirement and fail with
+# `ERROR: --no-build-isolation is not a valid editable requirement.`
+# (reproduced 2026-08-24 while iterating on this fix).
 echo "[dev] reinstalling alma-audit (editable) ..."
-PIP_NO_BUILD_ISOLATION=1 python3.11 -m pip install --quiet --editable "$WORK_TREE"
+python3.11 -m pip install --quiet --no-build-isolation --editable "$WORK_TREE"
 
 # Make the work tree world-readable so the inner `runuser -u nobody`
 # subprocesses (used by tests/test_exit_codes.py and

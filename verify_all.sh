@@ -44,18 +44,19 @@
 # `/src` mount would be wasted privilege; the `:ro` flag also makes
 # the intent obvious in `docker inspect`.
 #
-# Network: the docker runs here do NOT pass `--network=none`. The
+# Network: every `docker run` here uses `--network=none`. The
 # alma-audit audit itself never makes outbound calls (it only writes
 # local artifacts — see `tests/test_readonly.py`'s no-subprocess AST
-# check + the no-network egress clause in AGENTS.md), but the dev
-# container's entrypoint runs `pip install --editable` to pick up
-# local source changes — and pip 26.x resolves build-time
-# `setuptools>=61.0` via PyPI by default. With `--network=none` that
-# resolution fails (the `PIP_NO_BUILD_ISOLATION` env var no longer
-# disables isolation in pip 26 — only the `--no-build-isolation` CLI
-# flag does). The audit's no-network egress contract is unaffected:
-# the only outbound traffic is pip fetching a build-tool dependency
-# already pinned in `pyproject.toml`.
+# check + the no-network egress clause in AGENTS.md), and the dev
+# container's entrypoint now invokes `pip install --editable
+# --no-build-isolation`, so it reuses the system setuptools already
+# pinned by the image instead of re-resolving `setuptools>=61.0`
+# from PyPI. (pip 26.x dropped support for the `PIP_NO_BUILD_ISOLATION`
+# env var — only the CLI flag works — and that's what unblocks
+# `--network=none` on these docker runs.) The no-network-egress
+# contract for the audit binary itself is unaffected: any outbound
+# traffic that an audit run could in principle make is gated by
+# `--network=none` at the container layer.
 #
 # File mode: this script is committed with git mode `100755`. If you
 # are seeing `Permission denied` on `./verify_all.sh`, that is a Git
@@ -135,8 +136,8 @@ echo "verify_all.sh: using PYTHON=${PYTHON:-<none>} (${PY_VERSION})"
 echo "verify_all.sh: WORK=${WORK}"
 
 # ---------------------------------------------------------------------
-# 0a. Docker image readiness — build the dev image ONCE up front, so
-#     every docker run later in the script sees a populated cache.
+# 0a. Docker image readiness — ALWAYS run `docker build` once up front,
+#     before any phase that might `docker run` it.
 #
 #     Phases 2b (pytest fallback), 3b (analyzer listing fallback) and
 #     4 (synthetic audit) all `docker run alma-audit-dev:latest`.
@@ -144,31 +145,35 @@ echo "verify_all.sh: WORK=${WORK}"
 #     produced 26 PASS / 10 FAIL on a fresh checkout. Building here
 #     turns that into 36/36 regardless of host state.
 #
-#     The build is a no-op when the image already exists AND nothing
-#     in the build context (Dockerfile, requirements, etc.) changed —
-#     docker's layer cache means a warm host pays ~0s for this step.
+#     WHY WE DO NOT SHORT-CIRCUIT ON `docker image inspect`:
+#     The gate's job is to validate that the CURRENT Dockerfile +
+#     run-dev-tests.sh + deploy/ context in the working tree builds
+#     cleanly. If we skip the build when the image tag already
+#     exists, a stale, pre-PR image would mask Dockerfile/entrypoint
+#     regressions (reproduced on 2026-08-24: local image built at
+#     16:49, commit at 17:10, gate still went 36/36 exit 0 against
+#     the stale entrypoint). The unconditional `docker build` is the
+#     only honest test.
+#
+#     WARM-HOST COST: docker's layer cache means an unchanged
+#     Dockerfile + context produces an instant "build" — typical
+#     warm-host wall-clock is sub-second. The cold host pays the full
+#     build once; subsequent runs are free.
 # ---------------------------------------------------------------------
 DOCKER_IMAGE="alma-audit-dev:latest"
 DOCKER_READY=0
 if command -v docker >/dev/null 2>&1; then
-    # `docker image inspect` exits 0 when the image is present locally,
-    # non-zero otherwise — regardless of whether a registry pull would
-    # succeed. We deliberately do NOT pass --pull here.
+    # Always run `docker build`. Layer cache handles the warm case
+    # (~0s); cold case gets the full build before any `docker run`
+    # that would otherwise fail.
+    check "docker — image build ($DOCKER_IMAGE)" \
+        "cd '$WORK' && docker build -q -f deploy/Dockerfile.dev -t '$DOCKER_IMAGE' . >/dev/null"
     if docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
-        REPORT+=("--- docker — image present ($DOCKER_IMAGE) ---")
-        REPORT+=("PASS: docker — image present ($DOCKER_IMAGE)")
-        PASS=$((PASS+1))
         DOCKER_READY=1
-    else
-        check "docker — image build ($DOCKER_IMAGE)" \
-            "cd '$WORK' && docker build -q -f deploy/Dockerfile.dev -t '$DOCKER_IMAGE' . >/dev/null"
-        if docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
-            DOCKER_READY=1
-        fi
     fi
 else
-    REPORT+=("--- docker — image present ($DOCKER_IMAGE) ---")
-    REPORT+=("SKIP: docker — image present ($DOCKER_IMAGE)")
+    REPORT+=("--- docker — image build ($DOCKER_IMAGE) ---")
+    REPORT+=("SKIP: docker — image build ($DOCKER_IMAGE)")
     REPORT+=("  reason: docker not on PATH; pytest / analyzer-list / synthetic-audit fallbacks disabled")
 fi
 
@@ -263,7 +268,7 @@ if [ "$PYTEST_HOST_OK" -eq 0 ] && [ "$DOCKER_READY" -eq 1 ]; then
     # /tmp/alma_audit_work, so /src being read-only inside the
     # container is the right (and safer) contract.
     check "docker — pytest full suite green (fallback for missing host venv)" \
-        "cd '$WORK' && docker run --rm -v '$WORK':/src:ro $DOCKER_IMAGE -q"
+        "cd '$WORK' && docker run --rm --network=none -v '$WORK':/src:ro $DOCKER_IMAGE -q"
 elif [ "$PYTEST_HOST_OK" -eq 0 ]; then
     REPORT+=("--- pytest — full suite green (fallback for missing host venv) ---")
     REPORT+=("FAIL: pytest — full suite green (fallback for missing host venv)")
@@ -280,7 +285,7 @@ if [ -n "$PYTHON" ] && "$PYTHON" -c 'import alma_audit' 2>/dev/null; then
 elif [ "$DOCKER_READY" -eq 1 ]; then
     # Fallback to docker for the CLI listing — the image's editable
     # install makes `alma_audit.cli` importable there.
-    ANALYZER_LIST="$(cd "$WORK" && docker run --rm -v "$WORK":/src:ro $DOCKER_IMAGE --list-analyzers 2>&1 || true)"
+    ANALYZER_LIST="$(cd "$WORK" && docker run --rm --network=none -v "$WORK":/src:ro $DOCKER_IMAGE --list-analyzers 2>&1 || true)"
 else
     REPORT+=("--- CLI lists analyzer: <unavailable> ---")
     REPORT+=("FAIL: CLI lists analyzer: <unavailable>")
@@ -358,6 +363,7 @@ LOG
     RUN_RC=0
     docker run --rm \
         --user root \
+        --network=none \
         -v "$SYNTH_APACHE:/synth_apache:ro" \
         -v "$SYNTH_DOMLOG:/synth_domlogs:ro" \
         -v "$SYNTH_OUT:/synth_out:rw" \
