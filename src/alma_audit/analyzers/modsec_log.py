@@ -86,10 +86,16 @@ class ModSecAggregator:
         self.requests = 0
         self.actions: Counter[str] = Counter()
         self.rule_ids: Counter[str] = Counter()
-        # AISO-205: per-rule "first URI seen" map. Only the first hit
-        # sticks — later repeat-scanner hits for the same rule do not
-        # overwrite it. Keeps the operator-facing top-URI stable.
-        self._first_uri_by_rule: dict[str, str] = {}
+        # AISO-205 follow-up: per-rule URI occurrence counter. Each rule
+        # ID maps to a Counter of how many times it fired on each URI;
+        # `finalize()` picks the URI with the highest count (lex
+        # tie-break) so the operator-facing top-URI reflects where the
+        # rule is ACTUALLY firing, not where it first appeared. Previous
+        # "first-URI-wins" behaviour was flagged by the Supervisor as
+        # semantically wrong — `/rare-first` × 1 then `/common` × 3 used
+        # to surface `/rare-first`, which doesn't match the field name
+        # `top_uri` or the docstring's "X fired 80% of the time" claim.
+        self._uri_counts_by_rule: dict[str, Counter[str]] = {}
         self.max_severity: int = 0  # 0=none, 2=CRITICAL, 1=WARN, else notice
         self.critical_hits: list[dict[str, Any]] = []
 
@@ -105,8 +111,14 @@ class ModSecAggregator:
             self.actions[action] += 1
         for rid in ids:
             self.rule_ids[rid] += 1
-            if uri and rid not in self._first_uri_by_rule:
-                self._first_uri_by_rule[rid] = uri
+            # Count every URI occurrence per rule. Empty URI (parser
+            # could not extract B-section) is skipped — without a URI
+            # the operator cannot attribute the hit anyway, and we'd
+            # rather emit empty string than pollute the counter with
+            # one anonymous bucket that would tie-break against real
+            # URIs lexicographically.
+            if uri:
+                self._uri_counts_by_rule.setdefault(rid, Counter())[uri] += 1
         if max_sev > self.max_severity:
             self.max_severity = max_sev
         if max_sev >= 2:
@@ -117,20 +129,27 @@ class ModSecAggregator:
             })
 
     def finalize(self) -> dict[str, Any]:
-        # AISO-205: rule → count → top_uri, sorted by count desc, with
-        # rule_id asc as the deterministic tie-breaker (matches how the
-        # access_log / secure_log aggregators break ties elsewhere — see
-        # GAPS §7.4 "ordering invariants"). `top_rule_ids` and
-        # `modsec_rule_breakdown` must agree on ordering — otherwise the
-        # operator dashboard sees two different "top" lists for the
-        # same data and has to reconcile them by hand.
+        # AISO-205 follow-up: rule → count → top_uri, sorted by count
+        # desc with rule_id asc as the deterministic tie-breaker (matches
+        # the access_log / secure_log aggregators — see GAPS §7.4
+        # "ordering invariants"). `top_rule_ids` and `modsec_rule_breakdown`
+        # share the same ordering so the operator dashboard sees one
+        # consistent "top" list.
+        #
+        # `top_uri` per rule is the URI with the highest occurrence count
+        # for that rule. When two URIs tie on count, the lex-smallest URI
+        # wins — `Counter.most_common()` is NOT stable for ties, so we
+        # sort explicitly with `(-count, uri)` to keep the result
+        # reproducible across CPython runs (the original first-URI-wins
+        # approach was not stable either, but it was wrong on top of
+        # being non-deterministic).
         ranked = sorted(
             self.rule_ids.items(),
             key=lambda kv: (-kv[1], kv[0]),
         )
         top_rule_ids = [(rule_id, count) for rule_id, count in ranked[:_BREAKDOWN_TOP_N]]
         breakdown: list[tuple[str, int, str]] = [
-            (rule_id, count, self._first_uri_by_rule.get(rule_id, ""))
+            (rule_id, count, self._top_uri_for(rule_id))
             for rule_id, count in ranked[:_BREAKDOWN_TOP_N]
         ]
         return {
@@ -141,6 +160,20 @@ class ModSecAggregator:
             "max_severity_seen": self.max_severity,
             "critical_hit_count": len(self.critical_hits),
         }
+
+    def _top_uri_for(self, rule_id: str) -> str:
+        """Return the URI that fired `rule_id` the most often.
+
+        Deterministic lex tie-break: when two URIs tie on count, the
+        alphabetically smaller URI wins. Returns ``""`` when the parser
+        never supplied a URI for this rule (e.g. malformed B-section).
+        ``most_common()`` alone would surface an arbitrary tied URI;
+        we sort explicitly so dashboards stay reproducible.
+        """
+        counts = self._uri_counts_by_rule.get(rule_id)
+        if not counts:
+            return ""
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
 
 def _parse_modsec_request(lines: list[str]) -> tuple[str, list[str], int, str]:
