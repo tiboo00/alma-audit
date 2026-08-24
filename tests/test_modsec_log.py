@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from alma_audit.analyzers.modsec_log import (
+    ModSecAggregator,
     _iter_modsec_requests,
     _parse_modsec_request,
     analyze_modsec_and_errors,
@@ -50,10 +51,11 @@ Stop: 0
 def test_parse_modsec_request_extracts_action_and_ids():
     blocks = list(_iter_modsec_requests(SAMPLE_MODSEC.splitlines()))
     assert len(blocks) == 2
-    action, ids, sev = _parse_modsec_request(blocks[0])
+    action, ids, sev, uri = _parse_modsec_request(blocks[0])
     assert action == "intercepted"
     assert "942100" in ids
     assert sev == 2  # CRITICAL → 2
+    assert uri == "/.env"  # AISO-205: B-section request line is captured
 
 
 def test_parse_modsec_request_multi_field_line():
@@ -66,10 +68,12 @@ def test_parse_modsec_request_multi_field_line():
     lines = [
         '[line "12"] [id "942100"] [rev "1"] [msg "SQL Injection Attack"] [severity "CRITICAL"]',
     ]
-    action, ids, sev = _parse_modsec_request(lines)
+    action, ids, sev, uri = _parse_modsec_request(lines)
     assert "942100" in ids
     assert ids.count("942100") == 1, f"id 942100 must not be duplicated, got {ids}"
     assert sev == 2  # CRITICAL extracted from the multi-field line
+    # No B-section in this fixture → URI stays empty.
+    assert uri == ""
 
 
 def test_parse_modsec_request_action_overrides_message():
@@ -78,16 +82,20 @@ def test_parse_modsec_request_action_overrides_message():
         'Message: Access denied with code 403 (phase 1).',
         'Action: Intercepted (phase 1)',
     ]
-    action, _, _ = _parse_modsec_request(lines)
+    action, _, _, _ = _parse_modsec_request(lines)
     assert action == "intercepted"
 
 
 def test_parse_modsec_request_clean_request():
     blocks = list(_iter_modsec_requests(SAMPLE_MODSEC.splitlines()))
-    action, ids, sev = _parse_modsec_request(blocks[1])
+    action, ids, sev, uri = _parse_modsec_request(blocks[1])
     assert action == ""  # no deny
     assert ids == []
     assert sev == 0
+    # The second sample block hits /robots.txt with no action — even so,
+    # the B-section URI should still surface (the parser captures it
+    # regardless of action / severity).
+    assert uri == "/robots.txt"
 
 
 def _fs_with(files):
@@ -138,4 +146,155 @@ def test_analyzer_deny_threshold_tuning():
     # Should have INFO summary + CRITICAL from "severity=CRITICAL rule fired",
     # but NOT a WARN about denies.
     titles = [f.title for f in findings]
+    assert not any("ModSecurity denied" in t for t in titles)
+
+
+# ---------------------------------------------------------------------------
+# AISO-205: ModSecurity rule IDs detailed report.
+#
+# The existing finalize() already exposes `top_rule_ids: [(rule_id, count)]`,
+# but the issue asks for a richer `modsec_rule_breakdown` payload that also
+# surfaces the top request URI per rule (so the operator can tell *which*
+# payload triggered 942100 — /.env? /wp-login.php?). The tests below pin the
+# new contract down before the implementation lands.
+# ---------------------------------------------------------------------------
+
+
+def test_aggregator_modsec_rule_breakdown_units_by_count_then_rule_id():
+    """AISO-205 AC #2 + AC #5: aggregator exposes rule → count → top_uri,
+    sorted by count desc with rule_id asc as the deterministic tie-breaker.
+    """
+    agg = ModSecAggregator()
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/a")
+    agg.add_request(action="deny", ids=["942100", "941100"], max_sev=2, uri="/b")
+    agg.add_request(action="deny", ids=["941100"], max_sev=1, uri="/c")
+
+    result = agg.finalize()
+
+    assert "modsec_rule_breakdown" in result
+    breakdown = result["modsec_rule_breakdown"]
+    # 942100 appears twice (with /a on the first hit), 941100 appears twice
+    # (with /b on its first hit). Equal counts — tie-break on rule_id asc.
+    assert breakdown == [
+        ("941100", 2, "/b"),
+        ("942100", 2, "/a"),
+    ]
+    # top_rule_ids is the existing 2-tuple shape (AC #3 wiring).
+    assert result["top_rule_ids"] == [("941100", 2), ("942100", 2)]
+
+
+def test_aggregator_modsec_rule_breakdown_uri_first_seen_wins():
+    """The first URI to fire a rule sticks (later hits for the same rule
+    do not overwrite it). Keeps the operator-facing value stable across
+    noisy repeat-scanner traffic.
+    """
+    agg = ModSecAggregator()
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/first")
+    agg.add_request(action="deny", ids=["942100"], max_sev=2, uri="/second")
+
+    result = agg.finalize()
+
+    assert result["modsec_rule_breakdown"] == [("942100", 2, "/first")]
+
+
+def test_aggregator_modsec_rule_breakdown_caps_at_top_10():
+    """The breakdown is bounded at 10 rules so the JSON + MD don't blow up
+    on a long-tail CRS install.
+    """
+    agg = ModSecAggregator()
+    # 15 distinct rule IDs with descending counts.
+    for i in range(15):
+        rule_id = f"9{4100 + i:04d}"
+        # Each rule gets (15 - i) hits — first one is loudest.
+        for _ in range(15 - i):
+            agg.add_request(action="deny", ids=[rule_id], max_sev=2, uri=f"/u{i}")
+
+    result = agg.finalize()
+
+    assert len(result["modsec_rule_breakdown"]) == 10
+    # Loudest rule is the one with 15 hits.
+    assert result["modsec_rule_breakdown"][0][0] == "94100"
+    assert result["modsec_rule_breakdown"][0][1] == 15
+
+
+def test_parse_modsec_request_captures_request_uri_from_b_section():
+    """AISO-205: the URI sits on the first line of the B-section
+    (`GET /.env HTTP/1.1`). The parser must surface it so the aggregator
+    can attribute each rule to its triggering URI.
+    """
+    lines = [
+        "--deadbeef-A--",
+        "[17/Aug/2026:04:12:34 +0000] 1234567890 x.example 1.2.3.4 54321",
+        "--deadbeef-B--",
+        "GET /.env HTTP/1.1",
+        "Host: example.com",
+        "--deadbeef-E--",
+        '[line "12"] [id "942100"] [severity "CRITICAL"]',
+        "Action: Intercepted (phase 1)",
+    ]
+    action, ids, sev, uri = _parse_modsec_request(lines)
+    assert action == "intercepted"
+    assert ids == ["942100"]
+    assert sev == 2
+    assert uri == "/.env"
+
+
+def test_analyzer_top_rule_ids_matches_acceptance_criterion_5():
+    """AISO-205 AC #5: synthesize a log with two [id "942100"] and one
+    [id "941100"] entries — the 'ModSecurity denied' finding's `details`
+    block must list them with the loudest rule first.
+    """
+    block = """\
+--feedf00d-A--
+[17/Aug/2026:04:12:34 +0000] 1234567890 a.example 1.2.3.4 54321
+--feedf00d-B--
+GET /login.php HTTP/1.1
+--feedf00d-E--
+[line "12"] [id "942100"] [severity "CRITICAL"]
+Action: Intercepted (phase 1)
+--feedf00d-Z--
+--cafebabe-A--
+[17/Aug/2026:04:12:35 +0000] 1234567891 b.example 1.2.3.5 54322
+--cafebabe-B--
+GET /wp-admin HTTP/1.1
+--cafebabe-E--
+[line "12"] [id "942100"] [severity "CRITICAL"]
+Action: Intercepted (phase 1)
+--cafebabe-Z--
+--deadc0de-A--
+[17/Aug/2026:04:12:36 +0000] 1234567892 c.example 1.2.3.6 54323
+--deadc0de-B--
+GET /xmlrpc.php HTTP/1.1
+--deadc0de-E--
+[line "12"] [id "941100"] [severity "WARNING"]
+Action: Intercepted (phase 1)
+--deadc0de-Z--
+"""
+    fs = _fs_with({"/var/log/apache2/modsec_audit.log": block})
+    findings = analyze_modsec_and_errors(
+        error_paths=[],
+        modsec_paths=["/var/log/apache2/modsec_audit.log"],
+        fs=fs,
+    )
+
+    denied = [f for f in findings if "ModSecurity denied" in f.title]
+    assert denied, "expected a 'ModSecurity denied' finding"
+    details = denied[0].details
+    assert details["top_rule_ids"] == [("942100", 2), ("941100", 1)]
+
+
+def test_no_modsec_finding_unchanged_when_no_audit_logs_present():
+    """AISO-205 AC #4: when no modsec audit log is found, the existing
+    'No ModSecurity audit log files matched' INFO finding stays exactly
+    as it was before the new feature landed.
+    """
+    fs = _fs_with({})
+    findings = analyze_modsec_and_errors(
+        error_paths=[],
+        modsec_paths=["/var/log/apache2/modsec_audit.log"],
+        fs=fs,
+    )
+    titles = [f.title for f in findings]
+    assert "No ModSecurity audit log files matched" in titles
+    # No deny / no rule-breakdown finding when no data.
     assert not any("ModSecurity denied" in t for t in titles)
