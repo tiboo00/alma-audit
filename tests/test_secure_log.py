@@ -242,6 +242,74 @@ def test_aggregator_invalid_user_only_still_triggers_brute_force_rule():
     assert f.details["fail_count"] == 5
 
 
+def test_aggregator_brute_force_rule_deterministic_tiebreak_across_hashseeds():
+    """AISO-203 determinism regression lock (supervisor review).
+
+    Three IPs with identical brute-force totals must be reported in
+    the SAME order across every CPython hash seed. The rule previously
+    sorted by total only; ties landed in `set(...)` iteration order,
+    which is `PYTHONHASHSEED`-dependent. Five seeds reproduced five
+    distinct orderings on the pre-fix code.
+
+    The fix introduces an explicit tie-breaker: `-total` desc, then
+    `ip` ascending. We verify the property by re-running the rule
+    under several `PYTHONHASHSEED` values via subprocess and asserting
+    the produced `source_ip` order is identical every time.
+    """
+    import subprocess
+    import sys as _sys
+    import tempfile
+    from pathlib import Path as _P
+
+    repo_root = _P(__file__).resolve().parent.parent
+    script = r"""
+import sys
+sys.path.insert(0, %r)
+from alma_audit.analyzers.secure_log.aggregator import SecureAggregator
+from alma_audit.analyzers.secure_log.parser import parse_line
+from alma_audit.analyzers.secure_log.rules import rule_ssh_brute_force
+
+agg = SecureAggregator()
+# Three IPs, each with 3 ssh_fail + 0 ssh_invalid_user (= identical
+# combined total of 3). Mixed IP choice so neither the natural sort
+# order nor any hash-seed coincidence accidentally fixes the bug.
+for ip in ("9.10.11.12", "1.2.3.4", "5.6.7.8"):
+    for _ in range(3):
+        agg.add(parse_line(
+            "Aug 17 04:12:34 host sshd[1234]: "
+            "Failed password for root from " + ip + " port 12345 ssh2"
+        ))
+findings = rule_ssh_brute_force(
+    agg, settings={"ssh_fail_warn": 1, "ssh_fail_crit": 1000},
+)
+print(",".join(f.details["source_ip"] for f in findings))
+""" % str(repo_root / "src")
+
+    orders: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for seed in (1, 2, 3, 4, 5, 6, 7, 8):
+            out = subprocess.check_output(
+                [_sys.executable, "-c", script],
+                env={"PYTHONHASHSEED": str(seed), "PATH": _sys.prefix + "/bin:/usr/bin:/bin"},
+                cwd=tmp,
+                text=True,
+            ).strip()
+            orders.append(out)
+    # Every seed produces the same canonical order: IPs sorted
+    # ascending, because every IP has the same total and the
+    # tie-breaker is the IP itself.
+    expected = "1.2.3.4,5.6.7.8,9.10.11.12"
+    for seed, got in zip((1, 2, 3, 4, 5, 6, 7, 8), orders):
+        assert got == expected, (
+            f"PYTHONHASHSEED={seed} produced order {got!r}, "
+            f"expected {expected!r}. All observed: {orders}"
+        )
+    # And to be paranoid: every run is identical to every other run.
+    assert len(set(orders)) == 1, (
+        f"Expected one canonical order across seeds; got {set(orders)}"
+    )
+
+
 def test_aggregator_useradd_uid_zero_is_separate():
     agg = SecureAggregator()
     agg.add(parse_line(

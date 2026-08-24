@@ -56,13 +56,18 @@ def rule_ssh_brute_force(
     all_ips = set(agg.ssh_fail_by_ip) | set(agg.ssh_invalid_user_by_ip)
     if not all_ips:
         return findings
-    # Pre-compute the per-IP totals and sort by combined count desc.
+    # Pre-compute the per-IP totals and sort by combined count desc,
+    # then by IP ascending as a STABLE tie-breaker. Without the IP
+    # tie-breaker, ties land in `set(...)` iteration order, which is
+    # `PYTHONHASHSEED`-dependent — same input, different report. The
+    # `-total` + `ip` lexicographic key gives a deterministic ordering
+    # across CPython builds and hash seeds (project output contract).
     combined: list[tuple[str, int, int]] = []
     for ip in all_ips:
         fail_count = agg.ssh_fail_by_ip.get(ip, 0)
         invalid_count = agg.ssh_invalid_user_by_ip.get(ip, 0)
         combined.append((ip, fail_count, invalid_count))
-    combined.sort(key=lambda t: (t[1] + t[2]), reverse=True)
+    combined.sort(key=lambda t: (-(t[1] + t[2]), t[0]))
     for ip, fail_count, invalid_count in combined:
         total = fail_count + invalid_count
         if total >= settings["ssh_fail_crit"]:
