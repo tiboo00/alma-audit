@@ -116,10 +116,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "How to render AISO-210 structured fix suggestions. "
             "'text' (default) appends a '## Recommended fixes' section "
-            "to the Markdown report and emits fixes_recommended in the "
-            "forensic JSON. 'json' keeps only fixes_recommended in the "
-            "forensic JSON (no Markdown section). 'none' suppresses fix "
-            "rendering entirely (pre-AISO-210 behaviour)."
+            "to the Markdown report, keeps the per-finding 'fixes' "
+            "array in the main JSON, and emits 'fixes_recommended' in "
+            "the forensic JSON. 'json' keeps only 'fixes_recommended' "
+            "in the forensic JSON (no Markdown section) while leaving "
+            "the per-finding 'fixes' array intact in the main JSON. "
+            "'none' suppresses every fix rendering — pre-AISO-210 "
+            "behaviour, byte-identical to the legacy main JSON "
+            "(no 'fixes' field on any finding)."
         ),
     )
     return parser
@@ -195,15 +199,21 @@ def main(argv: list[str] | None = None) -> int:
     fs = RealFileSystem()
     findings = run_analyzers(cfg, fs)
 
-    # AISO-210: CLI controls how fix suggestions are rendered. The
-    # `text` value is the default — operators see the new section +
-    # the forensic JSON key. `json` skips the section but keeps
-    # fixes_recommended in the forensic JSON for downstream consumers.
-    # `none` rewinds both targets to pre-AISO-210 behaviour.
+    # AISO-210 / AISO-215: CLI controls how fix suggestions are rendered
+    # across all three artifacts. The `text` value is the default — the
+    # Markdown report has the `## Recommended fixes` section, the main
+    # JSON keeps the per-finding `fixes` array, and the forensic JSON
+    # ships `fixes_recommended`. `json` skips the Markdown section but
+    # keeps both the per-finding `fixes` (in the main JSON) and the
+    # top-level `fixes_recommended` (in the forensic JSON) — that mode
+    # is for SIEM/automation consumers who only want the machine-
+    # readable shape. `none` rewinds all three targets to pre-AISO-210
+    # behaviour: no Markdown section, no per-finding `fixes` array,
+    # no forensic `fixes_recommended` key.
     fix_format = getattr(args, "fix_format", "text")
 
     report = build_report(findings)
-    json_path = write_json_report(report, args.output)
+    json_path = write_json_report(report, args.output, fix_format=fix_format)
     md_path = write_markdown_report(report, args.output, fix_format=fix_format)
     forensic_path = write_forensic_report(report, args.output, fix_format=fix_format)
     cf_script_path = write_cloudflare_block_script(report, args.output)

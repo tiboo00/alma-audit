@@ -51,7 +51,18 @@ class Finding:
     # versions (PEP 649 + PEP 563 strings).
     fixes: tuple = ()
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, include_fixes: bool = True) -> dict:
+        """Serialise the Finding to a JSON-friendly dict.
+
+        AISO-215: ``include_fixes=False`` drops the ``fixes`` array
+        from the payload — used by ``write_json_report`` when
+        ``--fix-format=none`` is selected so the per-finding ``fixes``
+        array does not leak into ``alma-audit-latest.json`` while the
+        operator is explicitly suppressing fix suggestions. Callers
+        that want to inspect the dataclass directly (tests,
+        ``to_dict()`` round-trips) get the default ``True`` and the
+        field is present when the finding carries any structured fix.
+        """
         out: dict = {
             "module": self.module,
             "severity": self.severity.value,
@@ -60,6 +71,12 @@ class Finding:
             "details": self.details,
             "recommendation": self.recommendation,
         }
+        if not include_fixes:
+            # Explicit suppression: do not emit `fixes` at all. The
+            # AC#2 of AISO-215 requires this for `--fix-format=none`
+            # so the main JSON byte-for-byte matches pre-AISO-210
+            # output (no empty `fixes: []` key either).
+            return out
         # Only serialise fixes when the field was touched AND each
         # entry has the structured shape we expect. Older tests that
         # bypass fix_suggestions and pass plain tuples of strings
@@ -86,10 +103,10 @@ class AuditReport:
     findings: list = field(default_factory=list)
     summary: dict = field(default_factory=dict)
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, include_fixes: bool = True) -> dict:
         return {
             "timestamp": self.timestamp,
             "hostname": self.hostname,
-            "findings": [f.to_dict() for f in self.findings],
+            "findings": [f.to_dict(include_fixes=include_fixes) for f in self.findings],
             "summary": self.summary,
         }
