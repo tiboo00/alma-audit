@@ -64,6 +64,20 @@ _MSG_RE = re.compile(r"^Message:\s*(?P<msg>.*)$")
 # Action line — ModSecurity prints "Action: Intercepted (phase 1)".
 _ACTION_RE = re.compile(r"^Action:\s*(?P<a>\w+)")
 
+# B-section request line: `GET /.env HTTP/1.1`, `POST /wp-login.php HTTP/1.1`,
+# etc. Captures the request URI only (no method, no protocol). AISO-205 uses
+# this to attribute each ModSecurity rule hit back to the request that fired
+# it, so the operator can see "942100 fired 80% of the time on /login.php".
+# The URI may contain query strings, percent-encoded bytes, and is truncated
+# at whitespace — we never decode it here (audit-side normalization is the
+# reporting layer's job, not the parser's).
+_B_REQUEST_RE = re.compile(r"^(?P<method>[A-Z]+)\s+(?P<uri>\S+)\s+HTTP/[\d.]+$")
+
+# AISO-205: the breakdown payload is bounded so the report JSON + MD stay
+# scannable on a long-tail CRS install. Ten is enough for the operator's
+# "what rule is firing" eye-view without flooding the page.
+_BREAKDOWN_TOP_N = 10
+
 
 class ModSecAggregator:
     """Streaming aggregator for a single ModSecurity audit file."""
@@ -72,42 +86,106 @@ class ModSecAggregator:
         self.requests = 0
         self.actions: Counter[str] = Counter()
         self.rule_ids: Counter[str] = Counter()
+        # AISO-205: per-rule "first URI seen" map. Only the first hit
+        # sticks — later repeat-scanner hits for the same rule do not
+        # overwrite it. Keeps the operator-facing top-URI stable.
+        self._first_uri_by_rule: dict[str, str] = {}
         self.max_severity: int = 0  # 0=none, 2=CRITICAL, 1=WARN, else notice
         self.critical_hits: list[dict[str, Any]] = []
 
-    def add_request(self, action: str, ids: Iterable[str], max_sev: int) -> None:
+    def add_request(
+        self,
+        action: str,
+        ids: Iterable[str],
+        max_sev: int,
+        uri: str = "",
+    ) -> None:
         self.requests += 1
         if action:
             self.actions[action] += 1
         for rid in ids:
             self.rule_ids[rid] += 1
+            if uri and rid not in self._first_uri_by_rule:
+                self._first_uri_by_rule[rid] = uri
         if max_sev > self.max_severity:
             self.max_severity = max_sev
         if max_sev >= 2:
-            self.critical_hits.append({"action": action, "ids": list(ids), "severity": max_sev})
+            self.critical_hits.append({
+                "action": action,
+                "ids": list(ids),
+                "severity": max_sev,
+            })
 
     def finalize(self) -> dict[str, Any]:
+        # AISO-205: rule → count → top_uri, sorted by count desc, with
+        # rule_id asc as the deterministic tie-breaker (matches how the
+        # access_log / secure_log aggregators break ties elsewhere — see
+        # GAPS §7.4 "ordering invariants"). `top_rule_ids` and
+        # `modsec_rule_breakdown` must agree on ordering — otherwise the
+        # operator dashboard sees two different "top" lists for the
+        # same data and has to reconcile them by hand.
+        ranked = sorted(
+            self.rule_ids.items(),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        top_rule_ids = [(rule_id, count) for rule_id, count in ranked[:_BREAKDOWN_TOP_N]]
+        breakdown: list[tuple[str, int, str]] = [
+            (rule_id, count, self._first_uri_by_rule.get(rule_id, ""))
+            for rule_id, count in ranked[:_BREAKDOWN_TOP_N]
+        ]
         return {
             "requests_total": self.requests,
             "actions": dict(self.actions),
-            "top_rule_ids": self.rule_ids.most_common(10),
+            "top_rule_ids": top_rule_ids,
+            "modsec_rule_breakdown": breakdown,
             "max_severity_seen": self.max_severity,
             "critical_hit_count": len(self.critical_hits),
         }
 
 
-def _parse_modsec_request(lines: list[str]) -> tuple[str, list[str], int]:
-    """Parse a single ModSecurity request block. Returns (action, rule_ids, max_sev).
+def _parse_modsec_request(lines: list[str]) -> tuple[str, list[str], int, str]:
+    """Parse a single ModSecurity request block.
+
+    Returns ``(action, rule_ids, max_severity, request_uri)``.
 
     `action` is the most-severe action emitted by the rule set
     (intercepted / deny / drop / block). Lower-case normalized so the
-    aggregator can compare against its thresholds.
+    aggregator can compare against its thresholds. `request_uri` is the
+    path + query string of the B-section request line (e.g. `/.env`,
+    `/wp-login.php?foo=bar`) — empty string when the B-section is
+    malformed or absent (AISO-205 surfaces this so the operator's
+    `modsec_rule_breakdown` can pin each rule to its triggering URI).
     """
     action = ""
     action_severity = {"intercepted": 3, "deny": 3, "drop": 3, "block": 3, "pass": 1}
     rule_ids: list[str] = []
     max_sev = 0
+    request_uri = ""
+    in_b_section = False  # AISO-205: only the first B-section request line counts
     for line in lines:
+        # Section boundary tracking — the B-section request line is the
+        # only place where the request URI lives. We scan for the first
+        # `METHOD /uri HTTP/x.y` line that arrives after a `--X-B--`
+        # header; everything else in the B-section (Host / Cookie / UA
+        # headers) is ignored.
+        header_match = _MODSEC_HEADER_RE.match(line)
+        if header_match:
+            in_b_section = header_match.group(1) == "B"
+            # Any section header resets the URI — only the B-section that
+            # belongs to THIS request block counts.
+            if not in_b_section and header_match.group(1) != "B":
+                # Don't reset request_uri on non-B headers — the URI was
+                # captured the moment the B-section's request line arrived
+                # and should stay sticky through the rest of the block.
+                pass
+            continue
+        if in_b_section and not request_uri:
+            # First line inside B-section — almost always the request
+            # line (`GET /uri HTTP/1.1`). Skip leading whitespace just in
+            # case a rotator snuck in a blank line.
+            m = _B_REQUEST_RE.match(line.strip())
+            if m:
+                request_uri = m.group("uri")
         # Action line is authoritative when present: "Action: Intercepted (phase 1)"
         # overrides any earlier "Message: Access denied" heuristic at the same
         # severity level.
@@ -154,7 +232,7 @@ def _parse_modsec_request(lines: list[str]) -> tuple[str, list[str], int]:
                     max_sev = max(max_sev, 1)
                 elif v == "NOTICE":
                     max_sev = max(max_sev, 0)
-    return action, rule_ids, max_sev
+    return action, rule_ids, max_sev, request_uri
 
 
 def _iter_modsec_requests(lines: Iterable[str]) -> Iterable[list[str]]:
@@ -286,8 +364,8 @@ def analyze_modsec_and_errors(
                 break
             raw_lines.append(line)
         for block in _iter_modsec_requests(raw_lines):
-            action, ids, sev = _parse_modsec_request(block)
-            agg.add_request(action, ids, sev)
+            action, ids, sev, uri = _parse_modsec_request(block)
+            agg.add_request(action, ids, sev, uri=uri)
 
     if modsec_files == 0:
         findings.append(Finding(
