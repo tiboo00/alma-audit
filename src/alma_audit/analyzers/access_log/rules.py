@@ -32,9 +32,18 @@ from typing import Any
 
 from ...fix_suggestions import attach_fixes, lookup_fixes
 from ...models import Finding, Severity
+from ...self_ip import is_self_ip
 from ..crawler_verify import CrawlerSuppression, Resolver
 from .aggregator import AccessAggregator, SAFE_METHODS
 from .suppression import resolve_suppression
+
+
+def _is_self_ip(ip: str, self_ips: set[str]) -> bool:
+    """Self-IP check wrapper — rules.py uses the same predicate the
+    aggregator applies so D1/D4 stay aligned with the operator-eye
+    ``top_hosts`` summary.
+    """
+    return is_self_ip(ip, self_ips)
 
 
 def rule_top_host_concentration(
@@ -50,7 +59,27 @@ def rule_top_host_concentration(
     """
     if total_hits <= 0:
         return []
-    top_host, top_hits = agg.hosts.most_common(1)[0]
+    # AISO-211 review fix: the previous implementation read
+    # ``agg.hosts.most_common(1)[0]`` directly — i.e. the unfiltered
+    # per-IP counter that includes self-IP traffic. On a cPanel host
+    # with 30× localhost + 5× external that surfaces ``127.0.0.1
+    # (85.7%)`` as a D1 CRITICAL even though the operator-eye
+    # ``top_hosts`` summary correctly strips the localhost. The
+    # aggregator's ``self_ips`` set is the source of truth for the
+    # filter — apply it here too, mirroring the defense-in-depth
+    # pattern already used in ``AccessAggregator.finalize()``.
+    filtered_hosts = [
+        (ip, count)
+        for ip, count in agg.hosts.most_common()
+        if not _is_self_ip(ip, agg.self_ips)
+    ]
+    if not filtered_hosts:
+        # Every request came from a self-IP. There is no external
+        # top-host to flag — the forensic JSON keeps the
+        # self-IP diagnostic dump so the operator can still audit
+        # the noise, but D1 does not fire on self-traffic alone.
+        return []
+    top_host, top_hits = filtered_hosts[0]
     share = top_hits / total_hits
     ua_for_top = agg.last_ua_by_host.get(top_host, "")
     suppression = resolve_suppression(resolver, top_host, ua_for_top)
@@ -121,32 +150,40 @@ def rule_error_rate(
         c for code, c in agg.status_buckets.items() if 400 <= code < 600
     )
     err_rate = err_count / total_hits
-    # AISO-211: compute the localhost-excluded error rate from the
-    # aggregator's split lists. ``host_errors_top`` (external) and
-    # ``host_errors_internal_top`` (self-IP) are the two halves the
-    # aggregator already partitions in finalize(). When there's no
-    # self-IP traffic at all, the external rate is the same number
-    # as the total rate; we emit ``None`` for the external field in
-    # that case so downstream consumers can distinguish "the filter
-    # had nothing to do" from "filter applied, ratio == total".
-    external_rows: list[dict[str, Any]] = list(summary.get("host_errors_top", []))
-    internal_rows: list[dict[str, Any]] = list(summary.get("host_errors_internal_top", []))
-    # ``total_lines`` from the aggregator equals the sum of every
-    # ``hosts[ip]`` counter (the aggregator also bumps total_lines
-    # for every record, including the malformed ones it skipped).
-    # The external total is total_lines minus whatever self-IP
-    # traffic the aggregator saw. ``internal_rows`` already has
-    # ``total_requests`` for each self-IP, so we sum those to get
-    # the self-IP portion. When internal_rows is empty (no self-IP
-    # traffic at all), external_total == total_lines and we emit
-    # ``None`` for the external field so downstream consumers can
-    # distinguish "filter had nothing to do" from "filter applied,
-    # ratio == total".
-    external_total = total_hits - sum(r["total_requests"] for r in internal_rows)
-    external_err = sum(r["error_count"] for r in external_rows)
-    if external_total > 0 and internal_rows:
+    # AISO-211 review fix: the previous implementation computed the
+    # external error rate from the ``host_errors_internal_top`` list
+    # in the summary — but that list is capped at 20 entries AND only
+    # contains hosts that have produced errors. When every self-IP
+    # request was a 200 (e.g. cPanel self-admin-panel hits that
+    # resolved cleanly), no self-IP row appeared in
+    # ``host_errors_internal_top``, so ``internal_rows`` was empty
+    # and ``external_total`` collapsed back to ``total_hits``,
+    # giving ``error_rate_external=None`` for a sample where the
+    # external traffic was 10% errors but every self-IP request was
+    # a success. The fix: compute the per-IP rollup from
+    # ``agg.status_by_host`` directly — the uncapped per-host status
+    # map that the aggregator maintains. That gives us the real
+    # self-IP request total regardless of whether any self-IP
+    # request was an error.
+    self_total = 0
+    self_errors = 0
+    for ip, status_counter in agg.status_by_host.items():
+        if not _is_self_ip(ip, agg.self_ips):
+            continue
+        ip_total = sum(status_counter.values())
+        ip_errors = sum(c for code, c in status_counter.items() if 400 <= code < 600)
+        self_total += ip_total
+        self_errors += ip_errors
+    external_total = total_hits - self_total
+    external_err = err_count - self_errors
+    if external_total > 0 and self_total > 0:
         error_rate_external: float | None = external_err / external_total
     else:
+        # No self-IP traffic at all (external_total == total_hits),
+        # or every request was self-IP (external_total == 0).
+        # Emit ``None`` for the external field so downstream consumers
+        # can distinguish "the filter had nothing to do" from "filter
+        # applied, ratio == total".
         error_rate_external = None
     burst_ua = agg.last_ua_by_host.get(burst_host, "") if burst_host else ""
     d4_suppression = resolve_suppression(resolver, burst_host or "", burst_ua)
@@ -161,6 +198,8 @@ def rule_error_rate(
         "error_count": err_count,
         "external_error_count": external_err,
         "external_total_requests": external_total,
+        "self_total_requests": self_total,
+        "self_error_count": self_errors,
         "total": total_hits,
         "status_buckets": summary["status_buckets"],
         "burst_host": burst_host,
@@ -171,9 +210,9 @@ def rule_error_rate(
         # `host_errors_internal_top` keys are the explicit split for
         # forensic consumers that want to see the localhost traffic
         # partition alongside the external one.
-        "host_errors_top": external_rows,
-        "host_errors_external_top": external_rows,
-        "host_errors_internal_top": internal_rows,
+        "host_errors_top": summary.get("host_errors_top", []),
+        "host_errors_external_top": summary.get("host_errors_top", []),
+        "host_errors_internal_top": summary.get("host_errors_internal_top", []),
         "host_errors_total": summary.get("host_errors_total", 0),
     }
     # AISO-211: the severity decision is driven by the external rate

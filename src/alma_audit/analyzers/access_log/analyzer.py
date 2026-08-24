@@ -16,6 +16,7 @@ from typing import Any, Iterable
 
 from ...models import Finding, Severity
 from ...runners import FileSystem
+from ...self_ip import is_self_ip
 from ..crawler_verify import Resolver, SocketResolver
 from .aggregator import AccessAggregator
 from .parser import parse_line
@@ -27,6 +28,16 @@ from .rules import (
     rule_weird_methods,
 )
 from .settings import DEFAULT_RULES, is_compressed
+
+
+def _is_self_ip_for_analyzer(ip: str, self_ips: set[str]) -> bool:
+    """Local mirror of ``rules._is_self_ip`` for the analyzer call site.
+
+    Kept private to the analyzer module to avoid exporting the helper
+    in ``rules.py``'s public surface; the two helpers use the same
+    ``is_self_ip`` predicate from ``self_ip.py`` so D1/D4 stay aligned.
+    """
+    return is_self_ip(ip, self_ips)
 
 
 def analyze_access_logs(
@@ -147,7 +158,21 @@ def analyze_access_logs(
     ))
 
     total_hits = sum(agg.hosts.values())
-    top_host = agg.hosts.most_common(1)[0][0] if total_hits > 0 else None
+    # AISO-211 review fix: the previous call site used the unfiltered
+    # ``agg.hosts.most_common(1)`` for ``top_host``. On a cPanel host
+    # with 30× localhost + 5× external that surfaced ``127.0.0.1`` as
+    # the top host — both for the D1 rule (now fixed in the rule
+    # itself) and for the D4 ``burst_host`` argument that drives the
+    # crawler-suppression check. The crawler-suppression check is
+    # only meaningful for external traffic, so apply the self-IP
+    # filter here too. ``rule_top_host_concentration`` and
+    # ``rule_error_rate`` both re-filter as defense-in-depth.
+    top_host: str | None = None
+    if total_hits > 0:
+        for ip, _count in agg.hosts.most_common():
+            if not _is_self_ip_for_analyzer(ip, agg.self_ips):
+                top_host = ip
+                break
 
     findings.extend(rule_top_host_concentration(
         agg, total_hits, resolver, settings,

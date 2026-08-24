@@ -355,3 +355,216 @@ def test_analyzer_with_self_ips_excludes_localhost_from_d1(make_fs):
     assert len(details["self_ip_examples"]) <= 5
     # The top_hosts rollup strips self-IP.
     assert all(ip != "127.0.0.1" for ip, _ in details["top_hosts"])
+
+
+# ---------------------------------------------------------------------------
+# AISO-211 review regression tests (post-merge correctness bugs)
+# ---------------------------------------------------------------------------
+
+
+def test_rule_top_host_concentration_strips_self_ip():
+    """AISO-211 review fix: D1 must not fire on self-IP as the top host.
+
+    Repro from the Supervisor's review: 30× localhost + 5× external.
+    Pre-fix, ``rule_top_host_concentration`` read
+    ``agg.hosts.most_common(1)`` directly and surfaced ``127.0.0.1
+    (85.7%)`` as a CRITICAL even though the operator-eye
+    ``top_hosts`` summary correctly stripped the localhost. Post-fix,
+    the rule consumes the same self-IP-filtered view the aggregator
+    uses in ``finalize()`` — D1 fires on the external IP, not on
+    the host's own daemon.
+    """
+    rows = (
+        # 30 localhost 200s — cPanel self-admin-panel noise.
+        [("127.0.0.1", 200, "/") for _ in range(30)]
+        # 5 external 200s — the only external traffic in the sample.
+        + [("198.51.100.7", 200, "/") for _ in range(5)]
+    )
+    findings, _ = _run_error_rate_rule(
+        rows,
+        self_ips={"127.0.0.1"},
+    )
+    # No error-rate finding because the sample has no 4xx/5xx.
+    err_findings = [f for f in findings if "error rate" in f.title.lower()]
+    assert not err_findings, (
+        "no error-rate finding expected for an all-2xx sample"
+    )
+
+    # Drive the D1 rule directly to lock the regression.
+    from alma_audit.analyzers.access_log.rules import rule_top_host_concentration
+    agg = AccessAggregator(self_ips={"127.0.0.1"})
+    for rec in _build_records(rows):
+        agg.add(rec)
+    total_hits = sum(agg.hosts.values())
+    d1_findings = rule_top_host_concentration(
+        agg=agg,
+        total_hits=total_hits,
+        resolver=_resolver(),
+        settings={
+            "top_host_share_warn": 0.20,
+            "top_host_share_crit": 0.50,
+        },
+    )
+    # Pre-fix: CRITICAL 127.0.0.1 (85.7%). Post-fix: 198.51.100.7 at
+    # 5/35 = 14.3% — below the warn threshold, no finding at all.
+    assert d1_findings == [], (
+        f"D1 should be silent for a self-IP-dominated sample; "
+        f"got {d1_findings!r}"
+    )
+
+
+def test_rule_top_host_concentration_self_ip_only_no_finding():
+    """AISO-211 review fix: every record from self-IPs → no D1 finding.
+
+    Even with the warn threshold set low enough to trip on the
+    unfiltered rate, the self-IP-filtered view has no top host to
+    flag. The rule's ``filtered_hosts`` empty check returns an empty
+    list — the forensic JSON keeps the ``self_ip_event_count`` /
+    ``self_ip_examples`` diagnostic dump for the operator's audit
+    trail.
+    """
+    from alma_audit.analyzers.access_log.rules import rule_top_host_concentration
+    rows = [("127.0.0.1", 200, "/") for _ in range(50)]
+    agg = AccessAggregator(self_ips={"127.0.0.1"})
+    for rec in _build_records(rows):
+        agg.add(rec)
+    total_hits = sum(agg.hosts.values())
+    d1_findings = rule_top_host_concentration(
+        agg=agg,
+        total_hits=total_hits,
+        resolver=_resolver(),
+        settings={
+            "top_host_share_warn": 0.10,
+            "top_host_share_crit": 0.50,
+        },
+    )
+    assert d1_findings == []
+    # The aggregator's diagnostic dump is preserved for forensics.
+    summary = agg.finalize()
+    assert summary["self_ip_event_count"] == 50
+
+
+def test_rule_error_rate_external_when_self_ip_only_successful():
+    """AISO-211 review fix: external rate is correct even when self-IP traffic is all 2xx.
+
+    Repro from the Supervisor's review: 900× localhost 200 +
+    10× external 500 + 90× external 200. The correct external rate
+    is 10/100 = 10%. Pre-fix, the rule computed the external total
+    from the ``host_errors_internal_top`` list — which only
+    contains hosts that have produced errors and is capped at 20.
+    Because every self-IP request was a 200, no self-IP row
+    appeared in ``host_errors_internal_top``, so the pre-fix code
+    emitted ``error_rate_external=None`` for this sample. Post-fix,
+    the rule reads ``agg.status_by_host`` (uncapped) and computes
+    the right number.
+    """
+    rows = (
+        # 900 localhost successes — cPanel self-admin-panel hits
+        # that resolved cleanly. No self-IP errors.
+        [("127.0.0.1", 200, "/") for _ in range(900)]
+        # 10 external 500s.
+        + [("198.51.100.7", 500, "/") for _ in range(10)]
+        # 90 external successes.
+        + [("198.51.100.7", 200, "/") for _ in range(90)]
+    )
+    findings, summary = _run_error_rate_rule(
+        rows,
+        self_ips={"127.0.0.1"},
+    )
+    assert len(findings) == 1
+    details = findings[0].details
+    # 10 errors / 1000 total = 1% overall.
+    assert abs(details["error_rate_total"] - 0.01) < 1e-6
+    # External rate is 10 errors / 100 external requests = 10%.
+    assert details["error_rate_external"] is not None
+    assert abs(details["error_rate_external"] - 0.10) < 1e-6
+    # Self-IP total = 900, self-IP errors = 0 (every request was 200).
+    assert details["self_total_requests"] == 900
+    assert details["self_error_count"] == 0
+    assert details["external_total_requests"] == 100
+    assert details["external_error_count"] == 10
+    # External rate 10% >= warn → WARN, not CRITICAL.
+    assert findings[0].severity == Severity.WARN
+
+
+def test_rule_error_rate_external_from_uncapped_per_host_aggregate():
+    """AISO-211 review fix: the external rate is computed from the uncapped per-host aggregate.
+
+    Pre-fix regression: ``host_errors_internal_top`` is capped at 20
+    entries AND only contains hosts with errors. A self-IP with only
+    successes has no entry, so the pre-fix code computed
+    ``external_total = total_hits - 0 = total_hits`` and silently
+    returned ``error_rate_external=None``. The post-fix code reads
+    ``agg.status_by_host`` (uncapped per-host status map) and
+    produces the right answer.
+
+    This test also locks the new ``self_total_requests`` /
+    ``self_error_count`` forensic detail fields, which downstream
+    consumers can use to audit the self-IP noise partition.
+    """
+    rows = (
+        # Self-IP traffic split: 50 errors + 950 successes.
+        [("127.0.0.1", 404, "/") for _ in range(50)]
+        + [("127.0.0.1", 200, "/") for _ in range(950)]
+        # External traffic: 30 errors + 70 successes.
+        + [("198.51.100.7", 404, "/") for _ in range(30)]
+        + [("198.51.100.7", 200, "/") for _ in range(70)]
+    )
+    findings, _ = _run_error_rate_rule(
+        rows,
+        self_ips={"127.0.0.1"},
+    )
+    assert len(findings) == 1
+    details = findings[0].details
+    # Total: 80 errors / 1100 = 7.27%.
+    assert abs(details["error_rate_total"] - 80 / 1100) < 1e-6
+    # External: 30 errors / 100 external = 30%.
+    assert details["error_rate_external"] is not None
+    assert abs(details["error_rate_external"] - 0.30) < 1e-6
+    # Self-IP totals: 1000 requests, 50 errors.
+    assert details["self_total_requests"] == 1000
+    assert details["self_error_count"] == 50
+    # External totals: 100 requests, 30 errors.
+    assert details["external_total_requests"] == 100
+    assert details["external_error_count"] == 30
+    # 30% >= 20% crit → CRITICAL on the external rate.
+    assert findings[0].severity == Severity.CRITICAL
+
+
+def test_analyzer_burst_host_excludes_self_ip(make_fs):
+    """AISO-211 review fix: ``analyze_access_logs`` passes a self-IP-filtered burst_host.
+
+    The crawler-suppression branch in ``rule_error_rate`` is only
+    meaningful for external traffic. Pre-fix, the analyzer used
+    ``agg.hosts.most_common(1)`` directly and surfaced the
+    localhost as the burst host. Post-fix, the call site filters
+    self-IPs before assigning ``top_host``.
+
+    Verifies the contract via the summary finding's details —
+    ``burst_host`` (surfaced in ``rule_error_rate`` details) should
+    NOT be a self-IP.
+    """
+    log = (
+        # 30× localhost 200s + 5× external 500s.
+        "127.0.0.1 - - [17/Aug/2026:04:12:00 +0000] "
+        '"GET /index.html HTTP/1.1" 200 100 "-" "ua"\n'
+    ) * 30 + (
+        "198.51.100.7 - - [17/Aug/2026:04:12:30 +0000] "
+        '"GET /wp-login.php HTTP/1.1" 500 0 "-" "ua"\n'
+    ) * 5
+    fs = make_fs({"/var/log/apache2/access_log": log})
+    findings = analyze_access_logs(
+        ["/var/log/apache2/access_log"],
+        fs,
+        rules={"exclude_self_ips": True},
+        self_ips={"127.0.0.1"},  # type: ignore[call-arg]
+    )
+    err_findings = [
+        f for f in findings
+        if f.module == "access_log" and "error rate" in f.title.lower()
+    ]
+    assert err_findings, "expected an error-rate finding"
+    burst_host = err_findings[0].details.get("burst_host")
+    assert burst_host != "127.0.0.1", (
+        f"burst_host must not be a self-IP; got {burst_host!r}"
+    )
