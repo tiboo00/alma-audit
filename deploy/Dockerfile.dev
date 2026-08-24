@@ -1,0 +1,82 @@
+# AlmaLinux 8.10 dev container for alma-audit.
+#
+# Builds a hermetic environment that matches the production host
+# (AlmaLinux 8.10 — same os-release, same Python 3.11, same
+# `cryptography` version family) and runs the full pytest suite
+# against an editable install of the repo mounted at /src.
+#
+# Usage:
+#   docker build -f deploy/Dockerfile.dev -t alma-audit-dev:latest .
+#   docker run --rm -v "$PWD":/src alma-audit-dev:latest
+#
+# Why system-wide install (not a venv):
+#   - The `runuser -u nobody` test bodies in tests/test_exit_codes.py
+#     and tests/test_unreadable_log_root.py depend on the unprivileged
+#     `nobody` user being able to import the package + every runtime
+#     dependency from the standard Python path. A venv under /root is
+#     invisible to `nobody`.
+#   - AlmaLinux 8.10 ships python3.11 in the default repos
+#     (appstream); no extra module enable needed.
+#
+# Why pip-install at BUILD time:
+#   - On EL8, `pip install --user` lands under ~/.local, but root-level
+#     `pip install` lands under /usr/local/{lib,lib64}/python3.11/site-
+#     packages. The Python 3.11 interpreter, however, resolves
+#     `sys.path` for an unprivileged user via /usr/lib/python3.11/site-
+#     packages — /usr/local is NOT on that path. The bridge below
+#     symlinks every pip-installed package from /usr/local into
+#     /usr/lib/python3.11/site-packages so `nobody` finds them.
+#
+# Why editable (`pip install -e /src`) at RUN time:
+#   - The repo is bind-mounted at /src at run time, so the editable
+#     install has to happen inside the entrypoint. That way
+#     `git pull && docker run ...` re-runs the suite against the new
+#     code without rebuilding the image.
+#
+# Re-build the image only when the Dockerfile itself changes (rare).
+# For day-to-day test runs, mount the repo and re-run the existing
+# image — the entrypoint reinstalls the editable package every run.
+FROM almalinux:8.10
+
+# System packages + Python 3.11 + build tooling for cryptography
+# wheels. Keep the layer small by chaining all installs in one RUN
+# and cleaning the cache.
+RUN dnf install -y \
+        python3.11 \
+        python3.11-pip \
+        python3.11-devel \
+        gcc \
+        openssl-devel \
+        libffi-devel \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# Pre-install pytest + cryptography + PyYAML at BUILD time, then
+# bridge the /usr/local/site-packages split so unprivileged users
+# (specifically `nobody`, used by the test suite's `runuser -u
+# nobody` invocations) can find the modules on `sys.path`.
+# We use symlinks rather than copying: smaller image, and the layer
+# below only needs to re-run when `pip install` changes.
+RUN python3.11 -m pip install --quiet --upgrade pip \
+    && python3.11 -m pip install --quiet pytest cryptography PyYAML \
+    && for src_dir in /usr/local/lib/python3.11/site-packages /usr/local/lib64/python3.11/site-packages; do \
+         if [ -d "$src_dir" ]; then \
+           for d in "$src_dir"/*; do \
+             [ -e "$d" ] || continue; \
+             name="$(basename "$d")"; \
+             ln -sf "$d" "/usr/lib/python3.11/site-packages/$name"; \
+             ln -sf "$d" "/usr/lib64/python3.11/site-packages/$name"; \
+           done; \
+         fi; \
+       done
+
+# Copy the dev-test runner script. The repo itself is mounted at
+# /src at run time (see entrypoint), so this image only carries the
+# test orchestration.
+COPY deploy/run-dev-tests.sh /usr/local/bin/run-dev-tests.sh
+RUN chmod +x /usr/local/bin/run-dev-tests.sh
+
+# Working dir is the (mounted) repo root.
+WORKDIR /src
+
+ENTRYPOINT ["/usr/local/bin/run-dev-tests.sh"]
