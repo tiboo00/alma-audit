@@ -43,6 +43,8 @@ _FIX_FORMATS: tuple = (
 # don't drift across versions.
 _SCOPE_LABELS: dict = {
     SCOPE_LOCAL_CONFIG: "local_config (.htaccess, sudoers, sshd_config)",
+    "local_config:sudoers_review": "local_config: Sudoers entry review (per-user)",
+    "local_config:nopasswd_audit": "local_config: NOPASSWD: ALL fleet-wide audit",
     SCOPE_WAF: "waf (Cloudflare / ModSecurity)",
     "waf:cflare": "waf: Cloudflare (edge firewall rule)",
     "waf:modsec": "waf: ModSecurity (app-layer rule)",
@@ -552,13 +554,38 @@ def _render_recommended_fixes(lines: list[str], findings) -> None:
         by_scope.setdefault(fix.scope, []).append(fix)
 
     scope_index = {s: i for i, s in enumerate(SCOPE_ORDER)}
-    unknown_scopes = [s for s in by_scope if s not in scope_index]
+    # AISO-215 follow-up: sub-scoped keys (``waf:cflare``,
+    # ``local_config:sudoers_review``) collapse to their primary scope
+    # for ordering so they land adjacent to their bare-scope peers.
+    # Without this the renderer would push the sub-scope subsections to
+    # the bottom of the layout as "unknown scopes" — operators reading
+    # the cheap-first layout would never see them. Within a primary
+    # bucket that holds multiple sub-scoped subsections, we further
+    # order by the LOWEST risk among the subsection's fixes so the
+    # cheap-first reading order survives the split (a sub-bucket whose
+    # only fix is ``medium`` should still come after a sub-bucket
+    # whose only fix is ``low``).
+    unknown_scopes = [
+        s for s in by_scope
+        if s.split(":", 1)[0] not in scope_index
+    ]
+
+    def _bucket_sort_key(scope: str) -> tuple:
+        primary = scope.split(":", 1)[0]
+        bucket_fixes = by_scope[scope]
+        lowest_risk = min(
+            (RISK_ORDER.get(f.risk, 99) for f in bucket_fixes),
+            default=99,
+        )
+        return (
+            scope_index.get(primary, len(scope_index)),
+            lowest_risk,
+            scope,
+        )
+
     scopes_in_order: list = sorted(
         by_scope.keys(),
-        key=lambda s: (
-            scope_index.get(s, len(scope_index)),
-            s,
-        ),
+        key=_bucket_sort_key,
     )
 
     for scope in scopes_in_order:

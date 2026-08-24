@@ -370,6 +370,55 @@ def test_analyzer_emits_sudo_failure_findings():
     assert sudo[0].severity == Severity.WARN
 
 
+def test_analyzer_sudo_failure_finding_carries_both_d9_fixes():
+    """AISO-215 regression: end-to-end D9 finding must carry BOTH fixes.
+
+    Pre-fix the catalogue's flat ``finding_key|scope`` compound-key
+    collided on D9 — both fixes were ``local_config`` so the second
+    ``_add`` silently overwrote the first. The fix catalogue still
+    looked "populated" and the rule ran without error, but
+    ``attach_fixes(base, lookup_fixes("D9:sudo_failures"))`` only put
+    one fix on the emitted finding. Operators reading the rendered
+    report saw exactly one remediation for sudo failures.
+
+    This test runs the real analyzer end-to-end on sudo-failure log
+    lines and asserts the resulting ``Finding.fixes`` tuple carries
+    both catalogued fixes. It is the only test that catches the bug
+    in the rule-layer path — ``test_fix_library_populated_for_*``
+    checks the catalogue shape, not the finding payload.
+    """
+    from alma_audit.fix_suggestions import lookup_fixes
+
+    log = "\n".join([
+        "Aug 17 04:12:39 host sudo: pam_unix(sudo:auth): "
+        "authentication failure; user=root tty=pts/0 ruser=root"
+    ] * 5)
+    fs = FakeFileSystem(files={"/var/log/secure": log})
+    findings = analyze_secure_logs(["/var/log/secure"], fs)
+    sudo = [f for f in findings if "sudo" in f.title.lower()]
+    assert sudo, "expected a sudo-failure finding from the analyzer"
+    finding = sudo[0]
+    # The catalogue must contain 2 fixes for D9 — both must land on
+    # the emitted finding. Pre-fix the catalogue had 1 and the
+    # finding carried 1; this assertion would have passed with
+    # ``len == 1`` so the bug was invisible at this layer.
+    catalogue = lookup_fixes("D9:sudo_failures")
+    assert len(catalogue) == 2, (
+        f"D9 catalogue regressed to {len(catalogue)} fixes; "
+        f"expected 2 (sudoers-review + NOPASSWD audit)"
+    )
+    assert len(finding.fixes) == 2, (
+        f"D9 emitted finding carries {len(finding.fixes)} fixes; "
+        f"expected 2. The compound-key collision regressed — one of "
+        f"the catalogued fixes was overwritten before attach."
+    )
+    whats = {fix.what for fix in finding.fixes}
+    catalogue_whats = {fix.what for fix in catalogue}
+    assert whats == catalogue_whats, (
+        f"D9 finding carries {whats!r}, expected {catalogue_whats!r}"
+    )
+
+
 def test_analyzer_missing_log_root_emits_info_only():
     fs = FakeFileSystem()
     findings = analyze_secure_logs(["/var/log/secure"], fs)

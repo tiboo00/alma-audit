@@ -26,6 +26,7 @@ import os
 import pytest
 
 from alma_audit.analyzers.access_log import analyze_access_logs
+from alma_audit.analyzers.secure_log import analyze_secure_logs
 from alma_audit.fix_suggestions import (
     FIX_LIBRARY,
     RISK_ORDER,
@@ -84,13 +85,16 @@ def test_fix_library_populated_for_required_rules():
         for fix in fixes:
             assert isinstance(fix, FindingFix)
             # AISO-215: a fix's scope may be a primary scope
-            # (``local_config``, ``waf``, ...) OR a ``waf`` sub-scope
-            # (``waf:cflare``, ``waf:modsec``) — the latter is the
-            # new AISO-215 contract that splits the two D5/WAF fixes
-            # into distinct library rows. We accept any scope that
-            # either matches SCOPE_ORDER verbatim OR starts with
-            # ``waf:`` (a documented WAF sub-scope).
-            scope_ok = fix.scope in SCOPE_ORDER or fix.scope.startswith("waf:")
+            # (``local_config``, ``waf``, ...) OR a sub-scope under a
+            # documented primary (``waf:cflare``, ``waf:modsec``,
+            # ``local_config:sudoers_review``,
+            # ``local_config:nopasswd_audit``) — the latter is the
+            # collision-free contract that splits two fixes in the same
+            # primary bucket into distinct library rows. We accept any
+            # scope that either matches SCOPE_ORDER verbatim OR is a
+            # colon-sub-scope of one of those primaries.
+            primary = fix.scope.split(":", 1)[0]
+            scope_ok = primary in SCOPE_ORDER
             assert scope_ok, (
                 f"{key}/{fix.what} has unknown scope {fix.scope!r}"
             )
@@ -170,6 +174,64 @@ def test_d2_probe_hits_carries_three_fixes():
     assert SCOPE_LOCAL_CONFIG in scopes
     assert SCOPE_WAF in scopes
     assert SCOPE_APP_CONFIG in scopes
+
+
+def test_d9_sudo_failures_carries_two_distinct_fixes():
+    """AISO-215 regression: D9 must carry exactly 2 fixes, not silently collapse to 1.
+
+    AISO-215 review found that the flat ``f"{finding_key}|{scope}"``
+    compound-key collided on the D9 row: both fixes used
+    ``SCOPE_LOCAL_CONFIG`` as their scope, so the second ``_add``
+    silently overwrote the first. ``lookup_fixes("D9:sudo_failures")``
+    returned a 1-element tuple and ``attach_fixes`` propagated the
+    truncated set onto the finding — operators reading the rendered
+    report only ever saw the NOPASSWD audit remediation, never the
+    per-user sudoers review.
+
+    The pre-fix test (``test_fix_library_populated_for_required_rules``)
+    only asserted ``fixes,`` (truthy, i.e. at least one) which let the
+    collision through. This test pins the exact count to **2** and
+    asserts BOTH remediation whats are independently addressable so a
+    future regression that drops one back to 1 fails loudly.
+
+    The two fixes share the same primary bucket (``local_config``) —
+    the sub-scopes ``local_config:sudoers_review`` and
+    ``local_config:nopasswd_audit`` keep them collision-free while
+    letting the renderer group them under the local_config reading
+    order (mirroring the D5 ``waf:cflare`` / ``waf:modsec`` pattern).
+    """
+    fixes = lookup_fixes("D9:sudo_failures")
+    assert len(fixes) == 2, (
+        f"D9 expected exactly 2 fixes (sudoers-review + NOPASSWD audit), "
+        f"got {len(fixes)}. The flat compound-key collision has "
+        f"regressed — one D9 fix was silently overwritten."
+    )
+    whats = {fix.what for fix in fixes}
+    assert "Review the user's sudoers entry" in " ".join(whats), (
+        f"D9 missing the per-user sudoers-review fix; whats={whats!r}"
+    )
+    assert "Audit accounts with NOPASSWD: ALL" in " ".join(whats), (
+        f"D9 missing the fleet-wide NOPASSWD audit fix; whats={whats!r}"
+    )
+    # Each D9 fix must be independently addressable via lookup_fix so a
+    # consumer can fetch one without scanning the tuple. This locks
+    # the AC#1 shape: every (finding_key, scope) pair gets its own row.
+    sudoers = lookup_fix("D9:sudo_failures", "local_config:sudoers_review")
+    nopasswd = lookup_fix("D9:sudo_failures", "local_config:nopasswd_audit")
+    assert sudoers.scope == "local_config:sudoers_review"
+    assert "Review the user's sudoers entry" in sudoers.what
+    assert nopasswd.scope == "local_config:nopasswd_audit"
+    assert "NOPASSWD: ALL" in nopasswd.what
+    # The renderer-facing sub-scopes must collapse to the canonical
+    # ``local_config`` bucket so they stay adjacent to their bare-scope
+    # peers in the cheap-first reading order.
+    scope_index = {s: i for i, s in enumerate(SCOPE_ORDER)}
+    for fix in fixes:
+        primary = fix.scope.split(":", 1)[0]
+        assert scope_index.get(primary) == scope_index[SCOPE_LOCAL_CONFIG], (
+            f"D9 fix scope={fix.scope!r} must collapse to "
+            f"{SCOPE_LOCAL_CONFIG!r} for canonical ordering"
+        )
 
 
 # ----------------------------------------------------------------------
@@ -408,6 +470,47 @@ def test_fix_format_flag_none_suppresses_section(tmp_path):
             f"fix_format=none must strip per-finding 'fixes' from main JSON; "
             f"finding still carries fixes={finding.get('fixes')!r}"
         )
+
+
+def test_sub_scoped_buckets_order_by_lowest_risk_in_markdown(tmp_path):
+    """AISO-215 regression: sub-scoped renderer buckets respect cheap-first reading.
+
+    Pre-fix the renderer ordered sub-scope buckets by alphabetical
+    string — fine for D5 (``waf:cflare`` low before ``waf:modsec``
+    medium) but reversed for D9 (``local_config:nopasswd_audit``
+    medium sorts before ``local_config:sudoers_review`` low). The
+    operator reading the report saw the medium-risk fix first and
+    never reached the cheap low-risk fix above it. The fix orders
+    sub-buckets by the LOWEST risk among their fixes so the
+    cheap-first reading flow survives the split.
+
+    This test pins that contract: the low-risk D9 sub-bucket
+    (``sudoers_review``) must appear above the medium-risk D9
+    sub-bucket (``nopasswd_audit``) in the rendered Markdown.
+    """
+    from alma_audit.runners import FakeFileSystem
+
+    log = "\n".join([
+        "Aug 17 04:12:39 host sudo: pam_unix(sudo:auth): "
+        "authentication failure; user=root tty=pts/0 ruser=root"
+    ] * 6)
+    fs = FakeFileSystem(files={"/var/log/secure": log})
+    findings = analyze_secure_logs(["/var/log/secure"], fs)
+    report = build_report(findings, hostname="test-host")
+    md_path = write_markdown_report(report, str(tmp_path), fix_format="text")
+    text = open(md_path, encoding="utf-8").read()
+
+    # Locate the two D9 sub-section headers.
+    sudoers_idx = text.find("Sudoers entry review (per-user)")
+    nopasswd_idx = text.find("NOPASSWD: ALL fleet-wide audit")
+    assert sudoers_idx >= 0, "expected the low-risk D9 sub-section header"
+    assert nopasswd_idx >= 0, "expected the medium-risk D9 sub-section header"
+    assert sudoers_idx < nopasswd_idx, (
+        f"low-risk D9 sub-section must precede medium-risk D9 "
+        f"sub-section in the Markdown (cheap-first reading order); "
+        f"got sudoers_review at {sudoers_idx} and nopasswd_audit "
+        f"at {nopasswd_idx}"
+    )
 
 
 # ----------------------------------------------------------------------
