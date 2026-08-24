@@ -347,3 +347,117 @@ def test_cert_info_days_until_expiry_handles_timezones():
         is_ca=False,
     )
     assert info_naive.days_until_expiry(now=now) == 10
+
+
+# ---------------------------------------------------------------------------
+# AISO-197: per-IP forensic detail in access_log + secure_log analyzers
+# ---------------------------------------------------------------------------
+
+
+def _make_record(host: str, path: str, status: int, ua: str = "test") -> dict:
+    """Build an AccessRecord-shaped dict the aggregator can consume."""
+    from alma_audit.analyzers.access_log.parser import AccessRecord
+
+    return AccessRecord(
+        host=host,
+        timestamp="10/Oct/2025:13:55:36 -0700",
+        method="GET",
+        path=path,
+        status=status,
+        size=1024,
+        user_agent=ua,
+    )
+
+
+def test_probe_paths_by_ip_captures_per_ip_count_and_timestamps():
+    """Each probe-path hit must record the source IP, count, and timestamps."""
+    from alma_audit.analyzers.access_log.aggregator import AccessAggregator
+
+    agg = AccessAggregator()
+    agg.add(_make_record("1.2.3.4", "/.env", 404))
+    agg.add(_make_record("1.2.3.4", "/.env", 404))
+    agg.add(_make_record("5.6.7.8", "/wp-login.php", 403))
+    summary = agg.finalize()
+
+    # probe_paths_by_ip should have BOTH paths listed.
+    assert "/.env" in summary["probe_paths_by_ip"]
+    assert "/wp-login.php" in summary["probe_paths_by_ip"]
+    # /.env has 1 IP, 2 hits.
+    env_rows = summary["probe_paths_by_ip"]["/.env"]
+    assert len(env_rows) == 1
+    assert env_rows[0]["ip"] == "1.2.3.4"
+    assert env_rows[0]["count"] == 2
+    # wp-login has 1 IP, 1 hit.
+    wp_rows = summary["probe_paths_by_ip"]["/wp-login.php"]
+    assert len(wp_rows) == 1
+    assert wp_rows[0]["ip"] == "5.6.7.8"
+    # top_attackers should aggregate both IPs.
+    ips = [row["ip"] for row in summary["top_attackers"]]
+    assert "1.2.3.4" in ips
+    assert "5.6.7.8" in ips
+
+
+def test_top_attackers_aggregates_across_paths():
+    """An IP hitting multiple probe paths is rolled up into one attacker row."""
+    from alma_audit.analyzers.access_log.aggregator import AccessAggregator
+
+    agg = AccessAggregator()
+    # 1.2.3.4 hits /.env twice and /wp-login.php once.
+    agg.add(_make_record("1.2.3.4", "/.env", 404))
+    agg.add(_make_record("1.2.3.4", "/.env", 404))
+    agg.add(_make_record("1.2.3.4", "/wp-login.php", 403))
+    # 5.6.7.8 hits only /admin.php.
+    agg.add(_make_record("5.6.7.8", "/admin.php", 403))
+    summary = agg.finalize()
+
+    attacker_124 = next(r for r in summary["top_attackers"] if r["ip"] == "1.2.3.4")
+    assert attacker_124["total_probe_requests"] == 3
+    assert attacker_124["probe_paths"]["/.env"] == 2
+    assert attacker_124["probe_paths"]["/wp-login.php"] == 1
+    # 1.2.3.4 should be ranked first (3 > 1).
+    assert summary["top_attackers"][0]["ip"] == "1.2.3.4"
+
+
+def test_ssh_fail_details_per_ip_user_with_timestamps():
+    """SecureAggregator records SSH failures with (ip, user, count, timestamps)."""
+    from alma_audit.analyzers.secure_log.aggregator import SecureAggregator
+    from alma_audit.analyzers.secure_log.parser import SecureRecord
+
+    agg = SecureAggregator()
+    # Same IP, same user, 3 fails.
+    for i in range(3):
+        agg.add(SecureRecord(
+            event="ssh_fail", service="sshd",
+            source_ip="212.32.226.231", user="root",
+            username=None, uid=None, gid=None, pid=1234,
+            raw=f"Aug 17 04:12:34 host sshd[1234]: Failed password for root from 212.32.226.231 port {12345 + i} ssh2",
+            raw_timestamp=f"Aug 17 04:12:3{i}",
+        ))
+    summary = agg.finalize()
+    # One (ip, user) row.
+    assert len(summary["ssh_fail_details"]) == 1
+    row = summary["ssh_fail_details"][0]
+    assert row["ip"] == "212.32.226.231"
+    assert row["user"] == "root"
+    assert row["count"] == 3
+    # First/last seen timestamps tracked.
+    assert row["first_seen"] == "Aug 17 04:12:30"
+    assert row["last_seen"] == "Aug 17 04:12:32"
+
+
+def test_ssh_fail_details_groups_unknown_users_separately():
+    """Failed logins without a parsed user (rare syslog shapes) get a None user bucket."""
+    from alma_audit.analyzers.secure_log.aggregator import SecureAggregator
+    from alma_audit.analyzers.secure_log.parser import SecureRecord
+
+    agg = SecureAggregator()
+    agg.add(SecureRecord(
+        event="ssh_fail", service="sshd",
+        source_ip="9.9.9.9", user=None,
+        username=None, uid=None, gid=None, pid=1,
+        raw="<unknown shape>",
+        raw_timestamp="Aug 17 04:12:34",
+    ))
+    summary = agg.finalize()
+    assert len(summary["ssh_fail_details"]) == 1
+    assert summary["ssh_fail_details"][0]["user"] is None

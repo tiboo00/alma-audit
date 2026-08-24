@@ -10,6 +10,12 @@ Four rules, each emitting zero or more `Finding` records:
 The crawler-suppressibility distinction is the §6.1 contract:
 D2/D5 are never suppressed because a Googlebot asking for `/.env` is
 still an event — it is downgraded but not erased.
+
+AISO-197: every security-relevant rule attaches a `top_attackers`
+and (where applicable) a per-path / per-IP / per-host breakdown so the
+operator can identify the source of the activity, not just the
+aggregate count. The full forensic view is in the JSON `details`;
+the Markdown rendering slices it for readability.
 """
 
 from __future__ import annotations
@@ -110,6 +116,9 @@ def rule_error_rate(
         "status_buckets": summary["status_buckets"],
         "burst_host": burst_host,
         "crawler_suppression": d4_suppression.to_dict(),
+        # AISO-197: per-host error breakdown — top 20 hosts by error count.
+        "host_errors_top": summary.get("host_errors_top", []),
+        "host_errors_total": summary.get("host_errors_total", 0),
     }
     if err_rate >= settings["error_rate_crit"]:
         sev: Severity | None = Severity.CRITICAL
@@ -127,8 +136,8 @@ def rule_error_rate(
             title=f"Error burst suppressed on {burst_host} — verified crawler",
             description=(
                 f"4xx/5xx burst on host {burst_host!r} was attributed "
-                f"to a verified-crawler UA, so the D4 finding is "
-                f"downgraded to informational."
+                "to a verified-crawler UA, so the D4 finding is "
+                "downgraded to informational."
             ),
             details=d4_details,
             recommendation="No action required — claim was bidirectionally verified.",
@@ -171,12 +180,66 @@ def rule_probe_paths(
         ),
         details={
             "probe_hits": dict(agg.probe_hits),
+            # AISO-197: forensic detail — every (path, ip) pair with
+            # count / first_seen / last_seen / user_agents. No cap on
+            # list size per the operator's "show me everything" rule.
+            "probe_paths_by_ip": agg.probe_by_path_ip
+            and _serialise_probe_paths_by_ip(agg.probe_by_path_ip)
+            or {},
+            # AISO-197: top attacker rollup across all probe paths.
+            "top_attackers": _serialise_top_attackers(agg),
             # D2/D5: these are NEVER suppressed by crawler verification,
             # so the field is the `n/a` sentinel.
             "crawler_suppression": CrawlerSuppression.not_applicable().to_dict(),
         },
-        recommendation="Inspect source IPs and ensure those endpoints are blocked at the WAF.",
+        recommendation=(
+            "Inspect source IPs and ensure those endpoints are blocked at the WAF. "
+            "Top offenders are listed in `top_attackers`; full per-path detail in "
+            "`probe_paths_by_ip`."
+        ),
     )]
+
+
+def _serialise_probe_paths_by_ip(
+    probe_by_path_ip: dict[str, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Convert the aggregator's internal `_PerIPProbeStat` map to JSON-safe rows."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for path, ip_map in probe_by_path_ip.items():
+        rows = [
+            {
+                "ip": ip,
+                "count": stat.count,
+                "first_seen": stat.first_seen,
+                "last_seen": stat.last_seen,
+                "user_agents": list(stat.user_agents),
+            }
+            for ip, stat in ip_map.items()
+        ]
+        rows.sort(key=lambda r: r["count"], reverse=True)
+        out[path] = rows
+    return out
+
+
+def _serialise_top_attackers(agg: AccessAggregator) -> list[dict[str, Any]]:
+    """Per-IP rollup across all probe paths. Sorted by probe count desc."""
+    rows: list[dict[str, Any]] = []
+    for ip, probe_count in agg.probe_total_by_ip.items():
+        paths: dict[str, int] = {}
+        for path, ip_map in agg.probe_by_path_ip.items():
+            if ip in ip_map:
+                paths[path] = ip_map[ip].count
+        rows.append({
+            "ip": ip,
+            "total_probe_requests": probe_count,
+            "total_requests": agg.hosts.get(ip, 0),
+            "probe_paths": dict(sorted(paths.items(), key=lambda kv: kv[1], reverse=True)),
+            "first_seen": agg.ip_first_seen.get(ip, ""),
+            "last_seen": agg.ip_last_seen.get(ip, ""),
+            "user_agents": list(agg.ip_user_agents.get(ip, [])),
+        })
+    rows.sort(key=lambda r: r["total_probe_requests"], reverse=True)
+    return rows
 
 
 def rule_weird_methods(

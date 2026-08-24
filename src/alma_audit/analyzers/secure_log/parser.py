@@ -62,6 +62,7 @@ class SecureRecord(NamedTuple):
     gid: Optional[int]
     pid: Optional[int]
     raw: str
+    raw_timestamp: str = ""
 
 
 # Syslog timestamp header: "Aug 17 04:12:34.123456 2026" or the older
@@ -134,6 +135,8 @@ def parse_line(line: str) -> SecureRecord | None:
     return None.
     """
     # Drop the optional timestamp prefix to simplify the rest of the match.
+    ts_match = _TS_RE.match(line)
+    raw_ts = ts_match.group(0).strip() if ts_match else ""
     body = _TS_RE.sub("", line, count=1)
     svc_match = _SERVICE_RE.match(body)
     if not svc_match:
@@ -160,6 +163,7 @@ def parse_line(line: str) -> SecureRecord | None:
                 gid=None,
                 pid=pid,
                 raw=line,
+                raw_timestamp=raw_ts,
             )
         m = _SSH_FAIL_RE.search(rest)
         if m:
@@ -173,6 +177,7 @@ def parse_line(line: str) -> SecureRecord | None:
                 gid=None,
                 pid=pid,
                 raw=line,
+                raw_timestamp=raw_ts,
             )
         m = _SSH_ACCEPT_RE.search(rest)
         if m:
@@ -186,6 +191,7 @@ def parse_line(line: str) -> SecureRecord | None:
                 gid=None,
                 pid=pid,
                 raw=line,
+                raw_timestamp=raw_ts,
             )
         m = _SSH_INVALID_USER_RE.search(rest)
         if m:
@@ -199,6 +205,7 @@ def parse_line(line: str) -> SecureRecord | None:
                 gid=None,
                 pid=pid,
                 raw=line,
+                raw_timestamp=raw_ts,
             )
         return None
 
@@ -215,6 +222,7 @@ def parse_line(line: str) -> SecureRecord | None:
                 gid=None,
                 pid=pid,
                 raw=line,
+                raw_timestamp=raw_ts,
             )
         # "COMMAND=..." in a sudo session line. Not flagged by itself.
         if "COMMAND=" in rest and "authentication failure" not in rest:
@@ -228,6 +236,7 @@ def parse_line(line: str) -> SecureRecord | None:
                 gid=None,
                 pid=pid,
                 raw=line,
+                raw_timestamp=raw_ts,
             )
         return None
 
@@ -244,6 +253,7 @@ def parse_line(line: str) -> SecureRecord | None:
                 gid=int(m.group("gid")),
                 pid=pid,
                 raw=line,
+                raw_timestamp=raw_ts,
             )
         return None
 
@@ -260,6 +270,7 @@ def parse_line(line: str) -> SecureRecord | None:
                 gid=int(m.group("gid")),
                 pid=pid,
                 raw=line,
+                raw_timestamp=raw_ts,
             )
         return None
 
@@ -276,6 +287,7 @@ def parse_line(line: str) -> SecureRecord | None:
                 gid=None,
                 pid=pid,
                 raw=line,
+                raw_timestamp=raw_ts,
             )
         return None
 

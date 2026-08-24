@@ -77,20 +77,48 @@ def test_shell_metacharacter_is_critical():
 
 
 def test_subdirectory_is_flagged():
-    # FakeFileSystem has implicit dirs — adding a file under a sub-dir
-    # creates that sub-dir.
+    """Non-account-shaped sub-directories ARE flagged (anomaly).
+
+    AISO-198: cPanel account-ID-shaped sub-directories (random 8-char
+    alphanumeric names) are normal layout, so they emit INFO only.
+    Genuinely suspicious layouts (e.g. a `nested/year/` structure)
+    still emit WARN/CRITICAL.
+    """
     fs = _fs_with({
         f"{DOMLOG_ROOT}/zmrk2md30edvm/hostdzire.com": "log",
         f"{DOMLOG_ROOT}/hostdzire.com": "log",
     })
     findings = analyze_domlog_inventory([DOMLOG_ROOT], fs)
-    # Subdir should produce a WARN/CRITICAL finding.
+    # Account-ID-shaped subdir → INFO scope-info finding.
+    info_subs = [
+        f for f in findings
+        if "sub-director" in f.title.lower()
+    ]
+    assert info_subs, "Expected an INFO scope-info finding for the account subdir"
+    assert all(f.severity == Severity.INFO for f in info_subs)
+
+
+def test_non_account_subdirectory_is_anomaly():
+    """Sub-directories that don't match the cPanel account-ID shape are flagged.
+
+    A directory like `nested_2024/` (contains a digit pattern outside
+    the account-ID convention) is treated as a structural anomaly.
+    """
+    fs = _fs_with({
+        f"{DOMLOG_ROOT}/nested_2024_q1/hostdzire.com": "log",
+        f"{DOMLOG_ROOT}/hostdzire.com": "log",
+    })
+    findings = analyze_domlog_inventory([DOMLOG_ROOT], fs)
     subdir_findings = [
         f for f in findings
         if "sub-directory" in f.title.lower()
+        or "sub-director" in f.title.lower()
     ]
     assert subdir_findings
-    assert any(f.severity in (Severity.WARN, Severity.CRITICAL) for f in subdir_findings)
+    assert any(f.severity in (Severity.WARN, Severity.CRITICAL) for f in subdir_findings), (
+        f"Expected a WARN/CRITICAL for a non-account-shaped subdir; got: "
+        f"{[(f.severity, f.title) for f in subdir_findings]}"
+    )
 
 
 # ---------------------------------------------------------------------------

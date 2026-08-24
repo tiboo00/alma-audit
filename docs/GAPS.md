@@ -298,19 +298,18 @@ but always "what new file does this belong in".
 
 | File | Lines | Status | Notes |
 |---|---:|---|---|
-| `analyzers/access_log/parser.py` | 75 | 🟢 ok | pure parser; one concern |
-| `analyzers/access_log/aggregator.py` | 97 | 🟢 ok | streaming state + probe patterns + safe methods |
-| `analyzers/access_log/settings.py` | 36 | 🟢 ok | thresholds + compressed-suffix list |
-| `analyzers/access_log/suppression.py` | 40 | 🟢 ok | never-raises wrapper around the §6.1 chain |
-| `analyzers/access_log/rules.py` | 205 | 🟢 ok | D1/D4/D2/D5 detection rules |
+| `analyzers/access_log/aggregator.py` | 224 | 🟢 ok | AISO-197 — per-(path,ip) probe forensic + top_attackers rollup |
+| `analyzers/access_log/parser.py` | 75 | 🟢 ok | Apache combined-format access log line parser |
+| `analyzers/access_log/aggregator.py` | 224 | 🟢 ok | per-(path,ip) forensic detail, top_attackers, host_errors_top (AISO-197) |
+| `analyzers/access_log/rules.py` | 268 | 🟢 ok | D1/D4/D2/D5; D2 details include probe_paths_by_ip + top_attackers (AISO-197) |
 | `analyzers/access_log/analyzer.py` | 125 | 🟢 ok | orchestrator: `analyze_access_logs()` public entry |
 | `analyzers/access_log/__init__.py` | 41 | 🟢 ok | re-exports only, no logic |
 | `analyzers/domlog_roots.py` | 68 | 🟢 ok | AISO-194 — multi-root + bytes_log exclusion defaults |
-| `analyzers/domlog_inventory.py` | 425 | 🟢 ok | walks multiple roots; could split: `domlog_filename.py` + `domlog_layout.py` if it crosses 600 |
+| `analyzers/domlog_inventory.py` | 541 | 🟢 ok | AISO-198 — recursive scan, account-ID subdirs are scope-info (not anomaly) |
 | `analyzers/modsec_log.py` | 351 | 🟢 ok | could split: `modsec_parser.py` + `modsec_analyze.py` |
 | `analyzers/crawler_verify.py` | 317 | 🟢 ok | tightly scoped (one verification chain); keep as-is |
-| `analyzers/secure_log/parser.py` | 281 | 🟢 ok | AISO-186 — syslog + sudo + useradd regexes |
-| `analyzers/secure_log/aggregator.py` | 104 | 🟢 ok | streaming counters |
+| `analyzers/secure_log/parser.py` | 293 | 🟢 ok | AISO-186/197 — syslog + sudo + useradd regexes; carries raw_timestamp |
+| `analyzers/secure_log/aggregator.py` | 178 | 🟢 ok | AISO-197 — per-(ip,user) SSH/sudo forensic detail with timestamps |
 | `analyzers/secure_log/rules.py` | 197 | 🟢 ok | D8/D9/D10/D11 rules |
 | `analyzers/secure_log/settings.py` | 51 | 🟢 ok | thresholds + globs |
 | `analyzers/secure_log/analyzer.py` | 199 | 🟢 ok | orchestrator |

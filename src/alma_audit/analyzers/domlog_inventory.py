@@ -222,12 +222,81 @@ def _is_anomalous_filename(name: str) -> dict[str, Any] | None:
     return None
 
 
+def _walk_and_classify(
+    *,
+    root: str,
+    entries: list[str],
+    fs: FileSystem,
+    seen_paths: set[str],
+    all_anomalies: list[dict[str, Any]],
+    all_subdirs: list[dict[str, str]],
+    total_well_formed_ref: int,
+    settings: dict[str, Any],
+    max_depth: int,
+    files_visited_ref: int,
+    max_files_total: int,
+) -> tuple[int, int]:
+    """Recursive walk of a domlog directory, classifying each entry.
+
+    Returns (well_formed_count, files_visited) updated totals. Mutates
+    `all_anomalies`, `all_subdirs`, `seen_paths` in place.
+    """
+    well_formed = total_well_formed_ref
+    files_visited = files_visited_ref
+
+    def _walk(current_root: str, current_entries: list[str], depth: int) -> None:
+        nonlocal well_formed, files_visited
+        for name in current_entries:
+            if should_skip_filename(name):
+                continue
+            full = f"{current_root.rstrip('/')}/{name}"
+            if full in seen_paths:
+                continue
+            seen_paths.add(full)
+
+            if fs.is_dir(full):
+                # AISO-198: cPanel account-ID sub-directories are
+                # normal layout, not an anomaly. We record them in
+                # `all_subdirs` for the scope-info finding but do NOT
+                # flag them as CRITICAL/WARN — only filenames INSIDE
+                # the sub-directory are checked for anomalies.
+                all_subdirs.append({"subdir": name, "root": current_root})
+                if depth < max_depth:
+                    try:
+                        sub_entries = fs.listdir(full)
+                    except OSError:
+                        # Sub-directory unreadable — skip silently.
+                        # The top-level WARN finding already covered
+                        # the broad case; per-subdir unreadability is
+                        # a separate operator concern.
+                        continue
+                    _walk(full, sub_entries, depth + 1)
+                continue
+
+            # Leaf entry — feed to the anomaly detector.
+            if files_visited >= max_files_total:
+                return
+            files_visited += 1
+            reason = _is_anomalous_filename(name)
+            if reason is not None:
+                all_anomalies.append({
+                    "filename": name,
+                    "root": current_root,
+                    **reason,
+                })
+            else:
+                well_formed += 1
+
+    _walk(root, entries, depth=0)
+    return well_formed, files_visited
+
+
 def analyze_domlog_inventory(
     domlog_roots: list[str] | None,
     fs: FileSystem,
     rules: dict[str, Any] | None = None,
 ) -> list[Finding]:
-    """Scan one or more domlog directories and emit findings for anomalies.
+    """Scan one or more domlog directories (recursively) and emit findings.
 
     `domlog_roots` is a list of directories to walk. Pass `None` to use
     the default CloudLinux / cPanel layout
@@ -238,12 +307,27 @@ def analyze_domlog_inventory(
     are skipped at the discovery layer — see `domlog_roots.py` for the
     rationale (mod_log_config byte-counters and cPanel offset backups
     are not Apache combined-format logs).
+
+    AISO-198: sub-directories are walked one level deep (default
+    `max_subdir_depth = 1`). On a CloudLinux / cPanel host the canonical
+    layout is `/var/log/apache2/domlogs/<cpanel-account-id>/<domain>` —
+    the `<cpanel-account-id>` sub-directory is the **normal** layout,
+    not an anomaly. The 8-char random account ID is what cPanel writes
+    when the account is created. Operators with a deeper nesting
+    (e.g. `<user>/<year>/<domain>`) can override `max_subdir_depth`
+    via `modules.domlog_inventory.max_subdir_depth` in YAML.
     """
     settings = {
         "max_entries": 1000,
-        "max_subdir_depth": 0,  # domlogs should be flat — subdirs are suspect
+        # AISO-198: walk one level deep so we descend into cPanel
+        # account-ID sub-directories (`<root>/<account>/<domain>`).
+        # Override via YAML if your layout nests deeper.
+        "max_subdir_depth": 1,
+        "max_files": 10000,  # cap across the whole walk to bound the scan
         **(rules or {}),
     }
+    max_depth = max(0, int(settings.get("max_subdir_depth", 1)))
+    max_files_total = int(settings.get("max_files", 10000))
     roots = list(domlog_roots) if domlog_roots is not None else list(DEFAULT_DOMLOG_ROOTS)
 
     findings: list[Finding] = []
@@ -263,6 +347,8 @@ def analyze_domlog_inventory(
     all_subdirs: list[dict[str, str]] = []
     any_root_existed = False
     any_root_unreadable = False
+    seen_paths: set[str] = set()
+    files_visited = 0
 
     for root in roots:
         if not fs.is_dir(root):
@@ -275,7 +361,7 @@ def analyze_domlog_inventory(
         # swallows PermissionError at the runner layer; this
         # try/except is for non-Production runners that re-raise.
         try:
-            names = fs.listdir(root)
+            top_level_entries = fs.listdir(root)
         except OSError as exc:
             any_root_unreadable = True
             findings.append(Finding(
@@ -297,7 +383,7 @@ def analyze_domlog_inventory(
 
         # Distinguish "directory is empty" from "directory exists but is
         # unreadable" so the operator gets an actionable signal.
-        if not names and not fs.is_readable_dir(root):
+        if not top_level_entries and not fs.is_readable_dir(root):
             any_root_unreadable = True
             findings.append(Finding(
                 module="domlog_inventory",
@@ -315,38 +401,38 @@ def analyze_domlog_inventory(
             ))
             continue
 
-        if len(names) > settings["max_entries"]:
+        if len(top_level_entries) > settings["max_entries"]:
             findings.append(Finding(
                 module="domlog_inventory",
                 severity=Severity.WARN,
                 title="Domlog directory is unexpectedly large",
                 description=(
-                    f"Found {len(names)} entries under {root!r} "
+                    f"Found {len(top_level_entries)} top-level entries under {root!r} "
                     f"(threshold {settings['max_entries']}). Either the host "
                     "is multi-tenant at very large scale, or the directory is "
                     "being polluted."
                 ),
-                details={"count": len(names), "path": root},
+                details={"count": len(top_level_entries), "path": root},
             ))
 
-        for name in names:
-            # Skip mod_log_config byte counters and cPanel offset
-            # backups at the discovery layer so they don't trip the
-            # filename-shape detector. Real access logs (`<domain>`,
-            # `<domain>-ssl_log`) are not affected.
-            if should_skip_filename(name):
-                continue
-
-            full = f"{root.rstrip('/')}/{name}"
-
-            if fs.is_dir(full):
-                all_subdirs.append({"subdir": name, "root": root})
-                continue
-            reason = _is_anomalous_filename(name)
-            if reason is not None:
-                all_anomalies.append({"filename": name, "root": root, **reason})
-            else:
-                total_well_formed += 1
+        # AISO-198: walk recursively up to `max_depth` levels. We classify
+        # top-level entries by `fs.is_dir` and recurse into them; leaf
+        # entries go through the anomaly detector. The `seen_paths`
+        # set still keys on absolute path so symlinked or duplicated
+        # entries (across multi-root) are deduped.
+        total_well_formed, files_visited = _walk_and_classify(
+            root=root,
+            entries=top_level_entries,
+            fs=fs,
+            seen_paths=seen_paths,
+            all_anomalies=all_anomalies,
+            all_subdirs=all_subdirs,
+            total_well_formed_ref=total_well_formed,
+            settings=settings,
+            max_depth=max_depth,
+            files_visited_ref=files_visited,
+            max_files_total=max_files_total,
+        )
 
     if not any_root_existed:
         # None of the configured roots exist. Emit a single INFO
@@ -370,24 +456,54 @@ def analyze_domlog_inventory(
         pass
 
     if all_subdirs:
-        # Subdirectories under domlogs are a structural anomaly. cPanel
-        # writes a flat list of per-domain files there. A subdir like
-        # `domlogs/zmrk2md30edvm/hostdzire.com` indicates that an account
-        # ID was used as a directory name — almost always an error or a
-        # misconfigured addon domain.
-        sev = Severity.CRITICAL if len(all_subdirs) > 1 else Severity.WARN
-        findings.append(Finding(
-            module="domlog_inventory",
-            severity=sev,
-            title=f"Unexpected sub-directory under domlogs: {len(all_subdirs)}",
-            description=(
-                "Domlog files are expected to be flat per-domain entries. "
-                "Sub-directories usually indicate an account-id layout (e.g. "
-                "/domlogs/<cpanel-user>/) that bypasses standard log parsing."
-            ),
-            details={"subdirectories": all_subdirs},
-            recommendation="Inspect the subdirectory layout; cPanel addons often misbehave here.",
-        ))
+        # AISO-198: cPanel account-ID sub-directories (8-12 chars,
+        # alphanumeric with optional `_`/`-`) are normal layout:
+        # `/var/log/apache2/domlogs/<account>/<domain>`. Only flag
+        # CRITICAL/WARN when the layout is genuinely suspicious, e.g.
+        # `nested_2024_q1/` or `user/year/month/` structures that
+        # bypass the standard analyzer.
+        # Detection: a sub-directory is "account-id shaped" if its
+        # name is alphanumeric (`_`/`-` allowed), length 4..16, and
+        # contains no underscores (cPanel account IDs are pure
+        # alphanumeric or with single hyphens).
+        import re as _re
+        _ACCT_SHAPE = _re.compile(r"^[A-Za-z][A-Za-z0-9-]{3,15}$")
+        non_account_subdirs = [
+            s for s in all_subdirs
+            if not _ACCT_SHAPE.match(s["subdir"])
+        ]
+        if non_account_subdirs:
+            # Genuinely suspicious layout — original CRITICAL/WARN.
+            sev = Severity.CRITICAL if len(non_account_subdirs) > 1 else Severity.WARN
+            findings.append(Finding(
+                module="domlog_inventory",
+                severity=sev,
+                title=f"Unexpected sub-directory layout: {len(non_account_subdirs)}",
+                description=(
+                    "Domlog files are expected to be flat per-domain "
+                    "entries, or under cPanel account-ID sub-directories "
+                    "(`<root>/<account>/<domain>`). Non-account-shaped "
+                    "sub-directories usually indicate a misconfigured "
+                    "addon domain or a custom logrotate layout."
+                ),
+                details={"subdirectories": non_account_subdirs},
+                recommendation="Inspect the subdirectory layout.",
+            ))
+        else:
+            # AISO-198: account-ID sub-directories are normal scope-info.
+            findings.append(Finding(
+                module="domlog_inventory",
+                severity=Severity.INFO,
+                title=f"{len(all_subdirs)} cPanel account sub-director{'y' if len(all_subdirs) == 1 else 'ies'} scanned",
+                description=(
+                    f"Walked {len(all_subdirs)} cPanel account "
+                    f"sub-direct{'y' if len(all_subdirs) == 1 else 'ies'} "
+                    f"(recursive scan up to depth {max_depth}). Domain "
+                    "files inside each sub-directory are included in the "
+                    "inventory totals."
+                ),
+                details={"subdirectories": all_subdirs},
+            ))
 
     if all_anomalies:
         crit = sum(1 for a in all_anomalies if a["reason"] in {"filename_too_long", "shell_metacharacters"})
