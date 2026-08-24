@@ -15,8 +15,39 @@ import os
 import socket
 from typing import Iterable
 
+from .fix_suggestions import (
+    RISK_ORDER,
+    SCOPE_ORDER,
+    SCOPE_LOCAL_CONFIG,
+    SCOPE_WAF,
+    SCOPE_APP_CONFIG,
+    SCOPE_DNS_BLOCK,
+    SCOPE_KERNEL_PARAM,
+    all_fixes_from_findings,
+    sort_fixes,
+)
 from .forensic_export import build_forensic_export
 from .models import AuditReport, Finding, Severity
+
+# AISO-210: CLI `--fix-format` value sentinels.
+_FIX_FORMAT_TEXT = "text"        # current behaviour + "Recommended fixes" section
+_FIX_FORMAT_JSON = "json"        # only carry fixes_recommended; no MD section
+_FIX_FORMAT_NONE = "none"        # suppress fix rendering entirely
+_FIX_FORMATS: tuple = (
+    _FIX_FORMAT_TEXT,
+    _FIX_FORMAT_JSON,
+    _FIX_FORMAT_NONE,
+)
+
+# Display labels for the scope — keep stable so operator reports
+# don't drift across versions.
+_SCOPE_LABELS: dict = {
+    SCOPE_LOCAL_CONFIG: "local_config (.htaccess, sudoers, sshd_config)",
+    SCOPE_WAF: "waf (Cloudflare / ModSecurity)",
+    SCOPE_APP_CONFIG: "app_config (Apache httpd.conf, logrotate, fail2ban)",
+    SCOPE_DNS_BLOCK: "dns_block (hosts.deny, csf.deny, Cloudflare IP rule)",
+    SCOPE_KERNEL_PARAM: "kernel_param (sysctl / sshd_config Protocol)",
+}
 
 SEVERITY_EMOJI: dict[Severity, str] = {
     Severity.INFO: "✅",
@@ -127,7 +158,12 @@ def write_json_report(report: AuditReport, output_dir: str) -> str:
     return path
 
 
-def write_forensic_report(report: AuditReport, output_dir: str) -> str:
+def write_forensic_report(
+    report: AuditReport,
+    output_dir: str,
+    *,
+    fix_format: str = "text",
+) -> str:
     """Write the per-IP forensic JSON to <output_dir>/alma-audit-forensic.json.
 
     Bundles the scanner IPs, brute-force IPs, error-burst IPs, sudo-fail
@@ -135,12 +171,24 @@ def write_forensic_report(report: AuditReport, output_dir: str) -> str:
     readable file. Also embeds the Cloudflare firewall-rule payloads
     and a copy-paste-ready curl script so the operator can mass-block
     offenders without re-running the audit.
+
+    AISO-210 (fix_format): ``text`` and ``json`` both carry the
+    ``fixes_recommended`` array under the forensic JSON — downstream
+    SIEM / automation consumers always see the structured remediation
+    data. ``none`` omits the field (and the Markdown section) so
+    pre-AISO-210 consumers stay byte-identical.
     """
     forensic = build_forensic_export(
         report.findings,
         hostname=report.hostname,
         timestamp=report.timestamp,
     )
+    if fix_format == _FIX_FORMAT_NONE:
+        forensic.pop("fixes_recommended", None)
+        forensic.pop("fix_scope_order", None)
+    # Both `text` and `json` keep `fixes_recommended` in the forensic
+    # JSON. `text` additionally renders the Markdown section in
+    # write_markdown_report; `json` only ships the JSON.
     path = os.path.join(output_dir, "alma-audit-forensic.json")
     os.makedirs(output_dir, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
@@ -168,14 +216,30 @@ def write_cloudflare_block_script(report: AuditReport, output_dir: str) -> str:
     return path
 
 
-def write_markdown_report(report: AuditReport, output_dir: str) -> str:
+def write_markdown_report(
+    report: AuditReport,
+    output_dir: str,
+    *,
+    fix_format: str = "text",
+) -> str:
     """Write a CONCISE Markdown report.
 
     Per-IP forensic detail is intentionally omitted — full breakdown
     lives in `alma-audit-forensic.json`. The Markdown keeps the top 10
     entries per forensic field so the operator can skim the report
     without scrolling through tens of thousands of lines.
+
+    AISO-210 (fix_format): ``text`` (default) appends a
+    `## Recommended fixes` section grouped by scope. ``json`` omits
+    the section; the fixes live in `alma-audit-forensic.json` under
+    ``fixes_recommended``. ``none`` suppresses both the MD section
+    and the JSON key — pre-fix behaviour. Anything else raises
+    ValueError so a CLI typo fails closed.
     """
+    if fix_format not in _FIX_FORMATS:
+        raise ValueError(
+            f"unknown fix_format {fix_format!r}; expected one of {_FIX_FORMATS}"
+        )
     path = os.path.join(output_dir, "alma-audit-latest.md")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -214,6 +278,11 @@ def write_markdown_report(report: AuditReport, output_dir: str) -> str:
         lines.append("---")
         lines.append("")
     _render_cloudflare_appendix(lines, report)
+    # AISO-210: only emit the section when ``fix_format == 'text'``.
+    # The JSON / none branches leave the MD output untouched so
+    # existing operator dashboards / Slack webhooks don't drift.
+    if fix_format == _FIX_FORMAT_TEXT:
+        _render_recommended_fixes(lines, report.findings)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
     return path
@@ -401,6 +470,96 @@ def _render_details_summary(lines: list[str], details: dict) -> None:
             lines.append(head)
             lines.append("... (truncated)")
             lines.append("```")
+
+
+def _render_recommended_fixes(lines: list[str], findings) -> None:
+    """Append the ``## Recommended fixes`` section to the Markdown report.
+
+    AISO-210: groups fixes by scope (cheap → network-wide) and within
+    each scope by risk (low → medium → high). The output is the same
+    set of fixes that lands in ``alma-audit-forensic.json`` under
+    ``fixes_recommended`` — a single dedup pass happens in
+    ``fix_suggestions.all_fixes_from_findings`` so the MD and the
+    forensic JSON never disagree.
+
+    Empty fixes → empty section: we still emit the header so the
+    operator sees a deterministic shape (`yes, the audit considered
+    fixes; nothing to do here`) instead of a missing section.
+    """
+    fixes_deduped = all_fixes_from_findings(findings)
+    if not fixes_deduped:
+        # Always render the section so the operator knows the audit
+        # was aware of fixes — never silently skip the header when
+        # nothing actionable is attached (an empty report happens when
+        # an audit was clean).
+        lines.append("## Recommended fixes")
+        lines.append("")
+        lines.append("_No structured fixes attached to any finding._")
+        lines.append("")
+        return
+
+    sorted_fixes = sort_fixes(fixes_deduped)
+
+    lines.append("## Recommended fixes")
+    lines.append("")
+    lines.append(
+        "Concrete remediation steps grouped by scope — the cheapest, "
+        "lowest-blast-radius fix is shown first so the operator can stop "
+        "at the first one that matches the host's posture. Each fix ships "
+        "with the matching rollback note."
+    )
+    lines.append("")
+
+    # Group by scope in the canonical order. Unknown scopes go at the
+    # bottom (alphabetical fallback) so the layout stays deterministic.
+    by_scope: dict = {}
+    for fix in sorted_fixes:
+        by_scope.setdefault(fix.scope, []).append(fix)
+
+    scope_index = {s: i for i, s in enumerate(SCOPE_ORDER)}
+    unknown_scopes = [s for s in by_scope if s not in scope_index]
+    scopes_in_order: list = sorted(
+        by_scope.keys(),
+        key=lambda s: (
+            scope_index.get(s, len(scope_index)),
+            s,
+        ),
+    )
+
+    for scope in scopes_in_order:
+        label = _SCOPE_LABELS.get(scope, scope)
+        lines.append(f"### {label}")
+        lines.append("")
+        bucket = sorted(
+            by_scope[scope],
+            key=lambda f: (
+                RISK_ORDER.get(f.risk, 99),
+                f.what,
+            ),
+        )
+        for fix in bucket:
+            risk_marker = f" ({fix.risk} risk)" if fix.risk else ""
+            lines.append(f"**{fix.what}**{risk_marker}")
+            lines.append("")
+            lines.append(f"- **Why:** {fix.why}")
+            lines.append(f"- **Scope:** `{fix.scope}`")
+            if fix.commands:
+                lines.append("- **Apply:**")
+                lines.append("")
+                lines.append("```bash")
+                for cmd in fix.commands:
+                    lines.append(cmd)
+                lines.append("```")
+            if fix.rollback:
+                lines.append(f"- **Rollback:** {fix.rollback}")
+            lines.append("")
+
+    # Authoritative pointer to the structured JSON consumer.
+    lines.append(
+        "_Full deduplicated fix list (machine-readable, sorted by scope "
+        "+ risk):_ `alma-audit-forensic.json` → `fixes_recommended`."
+    )
+    lines.append("")
 
 
 def _render_cloudflare_appendix(lines: list[str], report: AuditReport) -> None:

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...fix_suggestions import attach_fixes, lookup_fixes
 from ...models import Finding, Severity
 from ..crawler_verify import CrawlerSuppression
 from .aggregator import SecureAggregator
@@ -110,7 +111,7 @@ def rule_ssh_brute_force(
         if sev is None:
             continue
         total = fail_count + invalid_count
-        findings.append(Finding(
+        base = Finding(
             module="secure_log",
             severity=sev,
             title=f"SSH brute-force from {ip}: {total} failed attempt(s)",
@@ -120,7 +121,7 @@ def rule_ssh_brute_force(
                 f"Breakdown: {fail_count} known-account "
                 f"credential-stuffing attempt(s) and "
                 f"{invalid_count} rotating-username "
-                f"enumeration attempt(s). "
+                "enumeration attempt(s). "
                 "Consistent with a brute-force campaign against the host."
             ),
             details={
@@ -139,7 +140,13 @@ def rule_ssh_brute_force(
                 "scanner (monitoring agent, ops jump host), add it to "
                 "the operator allowlist outside this package."
             ),
-        ))
+        )
+        # AISO-210: structured fixes — fail2ban ssh jail (the canonical
+        # defence), /etc/hosts.deny for the worst offender, and a
+        # Cloudflare WAF rule (only useful when the IP is external and
+        # the host is fronted by Cloudflare). The renderer lets the
+        # operator pick the cheapest first.
+        findings.append(attach_fixes(base, lookup_fixes("D8:ssh_brute_force")))
     return findings
 
 
@@ -159,7 +166,7 @@ def rule_sudo_failures(
             sev = Severity.WARN
         else:
             continue
-        findings.append(Finding(
+        base = Finding(
             module="secure_log",
             severity=sev,
             title=f"sudo authentication failures for {user}: {count}",
@@ -177,7 +184,12 @@ def rule_sudo_failures(
                 "Check the sudoers rule for this user; review the "
                 "session log for the originating tty / remote host."
             ),
-        ))
+        )
+        # AISO-210: structured fixes — review the user's sudoers rule
+        # (per-user, primary fix) and audit NOPASSWD: ALL entries
+        # (fleet-wide, secondary fix). Both are local_config scope;
+        # the renderer orders them by risk.
+        findings.append(attach_fixes(base, lookup_fixes("D9:sudo_failures")))
     return findings
 
 

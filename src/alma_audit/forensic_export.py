@@ -299,6 +299,9 @@ def build_cloudflare_curl_script(
 import json  # noqa: E402  (kept near the helper that needs it)
 
 
+from .fix_suggestions import SCOPE_ORDER, all_fixes_from_findings, sort_fixes  # noqa: E402
+
+
 def build_forensic_export(
     findings: list[Any],
     *,
@@ -414,6 +417,19 @@ def build_forensic_export(
         [_p for _p in cloudflare_payloads],
     )
 
+    # AISO-210: collect deduplicated, sorted fix recommendations across
+    # every finding. Two consumers read it:
+    #   1. forensic JSON consumers (SIEM ingestion, downstream automation).
+    #   2. the Markdown `## Recommended fixes` section (via reporting.py).
+    # The DEDUP happens inside `all_fixes_from_findings` (see
+    # fix_suggestions.py), so the same fix appearing on multiple
+    # findings collapses into a single row here.
+    fixes_deduped = all_fixes_from_findings(findings)
+    fixes_sorted = sort_fixes(fixes_deduped)
+    fixes_recommended: list[dict[str, Any]] = [
+        f.to_dict() for f in fixes_sorted
+    ]
+
     return {
         "hostname": hostname,
         "timestamp": timestamp,
@@ -449,6 +465,13 @@ def build_forensic_export(
         # here too, not only in `alma-audit-latest.json`. Empty list
         # is the correct sentinel when no domlog finding surfaced.
         "domlog_anomalies": domlog_anomalies,
+        # AISO-210: structured fix library (already-deduplicated,
+        # already sorted by (scope, risk, what)). Operators / SIEM
+        # consumers render their own remediation UI from this list.
+        # Scope constants are SCOPE_LOCAL_CONFIG / WAF / APP_CONFIG /
+        # DNS_BLOCK / KERNEL_PARAM — see fix_suggestions.py.
+        "fixes_recommended": fixes_recommended,
+        "fix_scope_order": list(SCOPE_ORDER),
         "cloudflare": {
             "payloads": cloudflare_payloads,
             "curl_script": cloudflare_curl_script,
