@@ -16,6 +16,7 @@ from .analyzers.csf_state import analyze_csf_state
 from .analyzers.domlog_inventory import analyze_domlog_inventory
 from .analyzers.modsec_log import analyze_modsec_and_errors
 from .analyzers.secure_log import analyze_secure_logs
+from .analyzers.ssh_hardening import analyze_ssh_config
 from .analyzers.ssl_cert import analyze_ssl_certs
 from .config import Config
 from .models import Finding, Severity
@@ -243,6 +244,18 @@ def run_analyzers(cfg: Config, fs: FileSystem) -> list[Finding]:
         cfg.paths.csf_allow_paths,
         fs,
         rules=cfg.modules.get("csf_state", {}),
+    ))
+
+    # AISO-209: SSH daemon hardening audit. Inspects sshd_config +
+    # sshd_config.d/*.conf drop-ins for weak settings (root login,
+    # password auth, default port, weak algorithms, ...). Reads via
+    # the injected FileSystem; emits its own INFO finding when the
+    # config / drop-ins are missing.
+    findings.extend(analyze_ssh_config(
+        fs,
+        config_path=cfg.paths.ssh_config_path,
+        drop_in_dir=cfg.paths.ssh_drop_in_dir,
+        rules=cfg.modules.get("ssh_hardening", {}),
     ))
 
     return findings

@@ -49,6 +49,7 @@ alma-audit/
 │       ├── secure_log/             # same 5-file split (AISO-186)
 │       ├── ssl_cert/               # same 5-file split (AISO-186, optional [ssl] extra)
 │       ├── cphulk_log/             # same 5-file split (AISO-186)
+│       ├── ssh_hardening/          # same 5-file split (AISO-209 — sshd_config audit)
 │       ├── csf_state.py            # flat — single-purpose CSF denylist reader (AISO-186)
 │       ├── domlog_inventory.py     # flat (541 LOC — the largest src file; AISO-198)
 │       ├── domlog_roots.py         # AISO-194 multi-root defaults
@@ -385,7 +386,7 @@ src/alma_audit/
 | **AISO-200** | Local-IP filter before CF rule emission (private/loopback/ULA/CGNAT/CF-internal ranges). | `forensic_export.py:_LOCAL_NETWORKS` |
 | **AISO-201** | Host self-IP detector (`socket.getaddrinfo`, no subprocess) → filter SSH/sudo brute-force events from self. | `self_ip.py`, `analyzers/secure_log/aggregator.py` |
 | **AISO-202** | CF rule payloads chunk at 500 IPs (4 KiB ceiling). | `forensic_export.py:_CHUNK_SIZE` |
-| **AISO-203..209** | Current rollup (see `verify_all.sh`). ssh_hardening analyzer (AISO-209) is the last ticket; fixtures pending in `tests/fixtures/`. | (rollup branch) |
+| **AISO-203..209** | Current rollup (see `verify_all.sh`). AISO-209 is the SSH hardening analyzer: `analyzers/ssh_hardening/` (5-file split) reads `/etc/ssh/sshd_config` + `/etc/ssh/sshd_config.d/*.conf` (alphabetical order, matching OpenSSH `Include`); flags PermitRootLogin yes / PermitEmptyPasswords yes / Protocol 1 as CRITICAL, weak Ciphers/MACs / default port / missing allowlist as WARN, X11Forwarding / prohibit-password / no Banner as INFO. | `analyzers/ssh_hardening/` |
 
 ## Gotchas / Boundaries
 
@@ -399,11 +400,11 @@ src/alma_audit/
 - **Never fabricate `daemon_id` / filesystem paths in tests** — read
   from `socket.gethostname()` or accept them as arguments; the
   `FakeFileSystem` covers in-memory needs.
-- **No `tests/fixtures/` directory exists yet.** `verify_all.sh` AISO-209
-  checks expect `tests/fixtures/sshd_config_weak.conf` and
-  `sshd_config_strong.conf` for the ssh_hardening analyzer; the
-  analyzer module is referenced by `runner.py` but the fixtures
-  and the analyzer package itself are still pending in the rollup.
+- **`tests/fixtures/`** holds static test inputs. Currently:
+  `sshd_config_weak.conf` and `sshd_config_strong.conf` for the
+  ssh_hardening analyzer (AISO-209). Add new fixtures here when an
+  analyzer needs a multi-line input file that doesn't fit inline
+  in the test body.
 - **`uv.lock` is git-ignored on purpose** (`.gitignore` line 45).
   `pyproject.toml` uses **setuptools**, not uv; the lockfile is a
   local artifact left behind by someone's dev shell. Don't ship it.

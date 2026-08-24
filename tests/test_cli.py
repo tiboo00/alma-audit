@@ -20,7 +20,18 @@ def test_list_analyzers_prints_three_names(capsys):
 def test_cli_creates_output_dir(tmp_path):
     out = tmp_path / "out"
     assert not out.exists()
-    rc = main(["--output", str(out), "--apache-root", "/nonexistent", "--domlog-root", "/nonexistent"])
+    rc = main([
+        "--output", str(out),
+        "--apache-root", "/nonexistent",
+        "--domlog-root", "/nonexistent",
+        # AISO-209: also point the ssh_hardening analyzer at a
+        # non-existent path so the run is purely INFO. On a real
+        # host the default sshd_config + drop-ins would otherwise
+        # fire WARN findings (e.g. missing AllowUsers), which is
+        # correct production behaviour but unrelated to what this
+        # test is exercising.
+        "--ssh-config", "/nonexistent",
+    ])
     assert rc == 0  # all INFO findings
     assert out.is_dir()
     assert (out / "alma-audit-latest.json").is_file()

@@ -102,6 +102,13 @@ def test_default_exit_code_with_real_filesystem_no_apache(tmp_path) -> None:
         "--output", str(tmp_path / "out"),
         "--apache-root", "/nonexistent",
         "--domlog-root", "/nonexistent",
+        # AISO-209: point the ssh_hardening analyzer at a
+        # non-existent path too, so the run is purely INFO. On a
+        # real host the default sshd_config + drop-ins would
+        # otherwise fire WARN findings (missing AllowUsers etc.),
+        # which is the correct production behaviour but
+        # unrelated to what this cron-smoke test checks.
+        "--ssh-config", "/nonexistent",
     ])
     assert rc == 0
 

@@ -78,6 +78,14 @@ class Paths:
     ssl_cert_glob: list[str] = field(default_factory=lambda: list(DEFAULT_SSL_CERT_GLOB))
     csf_deny_paths: list[str] = field(default_factory=lambda: [DEFAULT_CSF_DENY_PATH])
     csf_allow_paths: list[str] = field(default_factory=lambda: [DEFAULT_CSF_ALLOW_PATH])
+    # AISO-209: SSH daemon config + drop-in directory. Override via
+    # `paths.ssh_config_path` / `paths.ssh_drop_in_dir` in YAML or
+    # via `--ssh-config` on the CLI. The drop-in directory is
+    # walked alphabetically (matching OpenSSH ``Include`` semantics)
+    # and every ``*.conf`` is appended to the main config; the
+    # analyzer applies the standard last-wins rule.
+    ssh_config_path: str = "/etc/ssh/sshd_config"
+    ssh_drop_in_dir: str = "/etc/ssh/sshd_config.d"
 
     def access_log_paths(self) -> list[str]:
         return _expand(self.apache_root, self.access_log_glob)
