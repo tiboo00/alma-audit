@@ -76,6 +76,12 @@ modules:
     bandwidth_hog_min_lines: 1000
     bandwidth_hog_warn: 0.50
     bandwidth_hog_crit: 0.80
+    # AISO-208: cap on the per-IP distinct UA list that feeds the
+    # `top_attackers` rollup. The per-(path, ip) forensic detail in
+    # `probe_paths_by_ip` is uncapped; this is the operator-eye
+    # rollup bound. Negative disables the cap (operator opts into
+    # unbounded cost on UA-diverse per-IP traffic).
+    ip_user_agent_cap: 5
 
   domlog_inventory:
     max_entries: 1000

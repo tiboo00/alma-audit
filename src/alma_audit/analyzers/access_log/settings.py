@@ -27,6 +27,16 @@ DEFAULT_RULES: dict[str, Any] = {
     "bandwidth_hog_crit": 0.80,         # ≥80% → CRITICAL
     "max_files_scanned": 50,
     "max_lines_per_file": 200_000,
+    # AISO-208 (review fix #2): cap on the per-IP distinct UA list
+    # that drives the `top_attackers` rollup. This is purely a UI
+    # bound on the operator-eye summary; the per-(path, ip) forensic
+    # detail in `probe_by_path_ip` is uncapped (the operator wants
+    # the full distribution of UA hits against each probe path). The
+    # cap is here to stop the rollup from ballooning into an O(n²)
+    # membership scan on UA-diverse per-IP traffic. A value of 0 or
+    # negative disables the cap (the operator opts into unbounded
+    # cost). Default 5 mirrors the historic post-AISO-197 window.
+    "ip_user_agent_cap": 5,
 }
 
 

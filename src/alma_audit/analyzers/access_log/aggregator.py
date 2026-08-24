@@ -49,18 +49,64 @@ SAFE_METHODS: frozenset[str] = frozenset({
 
 
 class _PerIPProbeStat:
-    """Tracks (count, first_seen, last_seen, user_agents) for one (path, ip) pair."""
+    """Tracks per-(path, ip) probe totals + an unbounded UA counter.
 
-    __slots__ = ("count", "first_seen", "last_seen", "user_agents")
+    AISO-208 review fix: the bucket previously kept an *ordered, 5-UA-capped*
+    list of distinct user-agents, with no per-UA counts. The downstream
+    serializer then divided the bucket total by ``len(user_agents)`` and
+    assigned the quotient to each UA — a fabricated breakdown that
+    produced e.g. ``5/5`` for a real ``9× ua-A + 1× ua-B`` input. The
+    operator relied on those numbers and the report was provably wrong.
+
+    We now keep a ``Counter[str]`` of per-UA hit counts inside the
+    bucket. There is **no** cap on the number of distinct UAs (a
+    rotating scanner may surface dozens of UAs against one path; we
+    want the real distribution, not a 5-UA window).
+
+    AISO-208 review fix #2 (perf): the previous implementation did a
+    linear ``ua not in self.user_agents`` membership check on every
+    ``update()`` call. On a busy log that's a per-record O(distinct UAs)
+    scan, which adds up to O(n²) per (path, ip) bucket. We now drive the
+    "is this a new UA?" decision from the Counter's O(1) ``get`` —
+    ``append`` only runs the (rare) first-time path. Hot-path lookups
+    for repeat UAs skip the list entirely, so the bucket mutates in
+    constant time per record regardless of UA diversity.
+
+    Invariants this class guarantees:
+
+    * ``count`` is the total number of probe records seen on this
+      ``(path, ip)`` — equal to ``sum(ua_counts.values())`` for the
+      case where every record carried a UA. If some records lacked a
+      UA string, the bucket keeps an explicit ``"<unknown>"`` key so
+      the invariant still holds exactly.
+    * ``user_agents`` is the **insertion-ordered** list of distinct
+      UA strings seen — kept for human-readable display and for
+      backward compatibility with consumers that read
+      ``probe_paths_by_ip`` and expect a list of UAs.
+    * The first-seen / last-seen timestamps are tracked as
+      ``str`` min/max — Apache log lines have ISO-style timestamps
+      that compare lexicographically.
+    """
+
+    __slots__ = ("count", "first_seen", "last_seen", "user_agents", "ua_counts")
 
     def __init__(self, timestamp: str, user_agent: str) -> None:
         self.count = 1
         self.first_seen = timestamp
         self.last_seen = timestamp
-        # Up to 5 distinct user agents, in encounter order.
+        # Ordered list of distinct UA strings (encounter order). No cap.
+        # The list is appended to only when ``ua_counts`` sees a UA
+        # for the first time, so append cost is paid at most
+        # O(distinct-UAs) over the bucket's lifetime — never per record.
         self.user_agents: list[str] = []
-        if user_agent and user_agent not in self.user_agents:
-            self.user_agents.append(user_agent)
+        # Per-UA hit counts — the source of truth for the
+        # path × IP × UA breakdown AND the source for the
+        # "is this UA new?" O(1) membership check.
+        self.ua_counts: Counter[str] = Counter()
+        # Sentinel for empty UA strings (parser coerces ``None`` → ``""``).
+        _ua = user_agent if user_agent else "<unknown>"
+        self.ua_counts[_ua] += 1
+        self.user_agents.append(_ua)
 
     def update(self, timestamp: str, user_agent: str) -> None:
         self.count += 1
@@ -70,14 +116,36 @@ class _PerIPProbeStat:
             self.first_seen = timestamp
         if timestamp > self.last_seen:
             self.last_seen = timestamp
-        if user_agent and user_agent not in self.user_agents and len(self.user_agents) < 5:
-            self.user_agents.append(user_agent)
+        _ua = user_agent if user_agent else "<unknown>"
+        # O(1) Counter membership via ``get`` — drives both the count
+        # bump and the new-UA branch. The previous list-based
+        # ``not in self.user_agents`` scan was O(distinct UAs) per
+        # record and made the bucket O(n²) on UA-heavy paths.
+        if self.ua_counts.get(_ua, 0) == 0:
+            self.user_agents.append(_ua)
+        self.ua_counts[_ua] += 1
 
 
 class AccessAggregator:
-    """Streaming aggregator. Call `add(record)` per parsed line, then `finalize()`."""
+    """Streaming aggregator. Call `add(record)` per parsed line, then `finalize()`.
 
-    def __init__(self) -> None:
+    AISO-208 review fix #2 (perf): ``ip_user_agent_cap`` bounds the
+    per-IP rollup of distinct user-agents (the ``ip_user_agents`` field
+    that feeds ``top_attackers``). The previous PR removed this cap as
+    a side-effect of the per-probe change — that made the per-IP
+    rollup unbounded and turned the rollup into O(n²) per host on
+    UA-diverse traffic (measured on a real host: 10k records / 0.6s,
+    20k / 1.8s, 40k / 7.4s — quadratic amplification). The cap is
+    restored here, plumbed via the constructor so an operator can
+    lift or tighten it from the YAML config (AISO-207 contract).
+    """
+
+    def __init__(self, ip_user_agent_cap: int = 5) -> None:
+        # 0/5/10/N all bound the per-IP rollup at N distinct UAs.
+        # A negative value disables the cap (operator opts into the
+        # unbounded, O(n²)-on-UA-diverse-traffic behaviour — measured
+        # at 7.4s for 40k records / single IP).
+        self.ip_user_agent_cap = ip_user_agent_cap
         self.hosts: Counter[str] = Counter()
         self.paths: Counter[str] = Counter()
         self.methods: Counter[str] = Counter()
@@ -97,6 +165,13 @@ class AccessAggregator:
         self.probe_total_by_ip: Counter[str] = Counter()
         self.ip_first_seen: dict[str, str] = {}
         self.ip_last_seen: dict[str, str] = {}
+        # Per-IP distinct UA list (operator-eye rollup, NOT the
+        # per-path × per-IP forensic detail — that lives in
+        # ``probe_by_path_ip`` and is uncapped). AISO-208 review
+        # fix #2: the cap is restored at 5 to keep the rollup
+        # bounded; lift to a larger N (or disable via a negative
+        # value) in the YAML config if the operator really wants
+        # the full list.
         self.ip_user_agents: dict[str, list[str]] = defaultdict(list)
         # Status-by-host for per-host error breakdown (used by D4 details).
         self.status_by_host: dict[str, Counter[int]] = defaultdict(Counter)
@@ -112,11 +187,21 @@ class AccessAggregator:
         self.bytes_by_host[record.host] += record.size
         if record.user_agent:
             self.last_ua_by_host[record.host] = record.user_agent
-            if (
-                record.user_agent not in self.ip_user_agents[record.host]
-                and len(self.ip_user_agents[record.host]) < 5
-            ):
-                self.ip_user_agents[record.host].append(record.user_agent)
+            # AISO-208 review fix #2: the per-IP rollup has a bounded
+            # UA window (default 5). The bound is purely cosmetic at
+            # this layer — the forensic view in ``probe_by_path_ip``
+            # is unbounded — but without it the rollup allocates an
+            # O(distinct-UAs) list per host and the membership check
+            # becomes O(n²) across the whole log. The cap is plumbed
+            # through the constructor so the YAML config can lift /
+            # tighten it per deployment (AISO-207 contract).
+            #
+            # Sentinel: ``ip_user_agent_cap < 0`` disables the cap
+            # and falls through to ``append`` for every distinct UA.
+            ua_list = self.ip_user_agents[record.host]
+            new_ua = record.user_agent not in ua_list
+            if new_ua and (self.ip_user_agent_cap < 0 or len(ua_list) < self.ip_user_agent_cap):
+                ua_list.append(record.user_agent)
 
         # First/last seen per host (string comparison works for ISO-style
         # Apache timestamps like "10/Oct/2025:13:55:36 -0700").
@@ -142,8 +227,14 @@ class AccessAggregator:
                 break  # one pattern per record is enough
 
     def finalize(self) -> dict[str, Any]:
-        # probe_paths_by_ip: { path -> [ {ip, count, first_seen, last_seen, user_agents}, ... ] }
-        # Sorted by count desc so the operator's-eye view is "top offenders first".
+        # probe_paths_by_ip: { path -> [ {ip, count, first_seen, last_seen,
+        #                                 user_agents, user_agent_counts}, ... ] }
+        # `user_agents` is the insertion-ordered distinct-UA list
+        # (kept for backward compatibility with consumers that just
+        # want the names); `user_agent_counts` is the per-UA hit
+        # counts — the source of truth for any "path × IP × UA"
+        # breakdown (AISO-208 review fix). Sorted by count desc so the
+        # operator's-eye view is "top offenders first".
         probe_paths_by_ip: dict[str, list[dict[str, Any]]] = {}
         for path, ip_map in self.probe_by_path_ip.items():
             rows = [
@@ -153,6 +244,12 @@ class AccessAggregator:
                     "first_seen": stat.first_seen,
                     "last_seen": stat.last_seen,
                     "user_agents": list(stat.user_agents),
+                    # Per-UA counts — the AISO-208 review fix added
+                    # this field so the forensic JSON carries the
+                    # exact breakdown instead of a fabricated even
+                    # split. ``stat.ua_counts`` is a Counter[str];
+                    # ``dict(...)`` produces a JSON-safe plain dict.
+                    "user_agent_counts": dict(stat.ua_counts),
                 }
                 for ip, stat in ip_map.items()
             ]
