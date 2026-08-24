@@ -438,6 +438,155 @@ def test_rule_per_directive(directive, value, expected_sev, expected_substr):
 
 
 # --------------------------------------------------------------------
+# Additive Port directive — every Port occurrence must be examined
+# (acceptance criterion #3 — Port 22 must always fire, even when it
+# appears AFTER another Port value). The rule layer scans every
+# occurrence via ``SshdConfigSnapshot.all_directives("port")``; the
+# finding's source metadata comes from the actual Port 22 line.
+# --------------------------------------------------------------------
+
+
+def test_additive_port_22_after_other_port_still_fires():
+    """``Port 2222`` then ``Port 22`` — sshd binds BOTH ports, so the
+    default-port WARN must fire. The finding's ``source_path`` /
+    ``source_line`` must come from the actual ``Port 22`` line, not
+    from ``Port 2222``.
+
+    Regression for the false negative that survived the previous
+    review-fix pass: the aggregator stored the second ``Port 22``
+    in ``directive_extras`` as a bare values tuple (losing the
+    source_line), and the rule only looked at the first directive.
+    """
+    fs = FakeFileSystem(files={
+        DEFAULT_SSHD_CONFIG_PATH: (
+            "Port 2222\n"
+            "Port 22\n"
+            "Protocol 2\n"
+        ),
+    })
+    findings = analyze_ssh_config(fs)
+    matches = _by_title(findings, "default port 22")
+    assert len(matches) == 1, (
+        f"Expected exactly one default-port finding, got "
+        f"{[f.title for f in findings]}"
+    )
+    finding = matches[0]
+    assert finding.severity == Severity.WARN
+    # The source line in details must be the Port 22 line, not Port 2222.
+    assert finding.details["source_line"] == "Port 22", (
+        f"Expected source_line='Port 22', got "
+        f"{finding.details['source_line']!r}"
+    )
+    assert finding.details["value"] == "22"
+    # all_ports carries every observed value in stream order for
+    # operator context.
+    assert finding.details["all_ports"] == ["2222", "22"]
+
+
+def test_additive_port_22_first_still_fires():
+    """``Port 22`` then ``Port 2222`` — first-obtained value is 22
+    (already fired by the previous implementation). Locks the
+    reverse-order case so the additive scan doesn't regress on the
+    straightforward path either.
+    """
+    fs = FakeFileSystem(files={
+        DEFAULT_SSHD_CONFIG_PATH: (
+            "Port 22\n"
+            "Port 2222\n"
+            "Protocol 2\n"
+        ),
+    })
+    findings = analyze_ssh_config(fs)
+    matches = _by_title(findings, "default port 22")
+    assert len(matches) == 1
+    assert matches[0].details["source_line"] == "Port 22"
+    assert matches[0].details["all_ports"] == ["22", "2222"]
+
+
+def test_additive_port_22_across_files_attributes_to_drop_in():
+    """Cross-file additive: main has ``Port 2222``, drop-in re-asserts
+    ``Port 22``. The finding's ``source_path`` must point at the
+    drop-in (where the ``Port 22`` actually lives) and ``all_ports``
+    must list both values in stream order.
+    """
+    fs = FakeFileSystem(files={
+        DEFAULT_SSHD_CONFIG_PATH: (
+            f"Include {DEFAULT_SSHD_DROP_IN_DIR}/*.conf\n"
+            "Port 2222\n"
+            "Protocol 2\n"
+        ),
+        f"{DEFAULT_SSHD_DROP_IN_DIR}/10-default.conf": "Port 22\n",
+    })
+    findings = analyze_ssh_config(fs)
+    matches = _by_title(findings, "default port 22")
+    assert len(matches) == 1
+    finding = matches[0]
+    assert finding.details["source_path"] == (
+        f"{DEFAULT_SSHD_DROP_IN_DIR}/10-default.conf"
+    )
+    assert finding.details["source_line"] == "Port 22"
+    # Stream order: Include at top → drop-in Port 22 → main Port 2222.
+    # The drop-in's 22 is the first obtained value; the additive
+    # list still shows both in stream order.
+    assert finding.details["all_ports"] == ["22", "2222"]
+
+
+def test_additive_port_no_22_does_not_fire():
+    """``Port 2222`` followed by ``Port 5022`` — no 22 anywhere, no
+    default-port WARN. The new additive scanner must still emit
+    nothing when the 22 is absent.
+    """
+    fs = FakeFileSystem(files={
+        DEFAULT_SSHD_CONFIG_PATH: (
+            "Port 2222\n"
+            "Port 5022\n"
+            "Protocol 2\n"
+        ),
+    })
+    findings = analyze_ssh_config(fs)
+    assert _by_title(findings, "default port 22") == []
+
+
+def test_additive_port_aggregator_preserves_source_metadata():
+    """Unit-level: the aggregator's ``directive_extras`` for ``port``
+    must contain full ``SshdDirective`` records (not bare values
+    tuples), so the rule layer can attribute findings to the actual
+    source line. This is the structural half of the regression
+    lock — the behavioural half is the integration tests above.
+    """
+    from alma_audit.analyzers.ssh_hardening.aggregator import aggregate
+    from alma_audit.analyzers.ssh_hardening.parser import SshdDirective
+
+    snap = aggregate([
+        SshdDirective(
+            keyword="Port",
+            values=("2222",),
+            source_path="/etc/ssh/sshd_config",
+            source_line="Port 2222",
+        ),
+        SshdDirective(
+            keyword="Port",
+            values=("22",),
+            source_path="/etc/ssh/sshd_config.d/10-default.conf",
+            source_line="Port 22",
+        ),
+    ])
+    # The extras list holds full SshdDirective records.
+    extras = snap.directive_extras["port"]
+    assert len(extras) == 1
+    assert isinstance(extras[0], SshdDirective)
+    assert extras[0].source_path == "/etc/ssh/sshd_config.d/10-default.conf"
+    assert extras[0].source_line == "Port 22"
+    # The all_directives helper yields every Port in stream order
+    # so the rule layer can scan past the first value.
+    all_ports = snap.all_directives("port")
+    assert [d.values[0] for d in all_ports] == ["2222", "22"]
+    # Scalar (non-additive) directives still return just the
+    # first-obtained record.
+    assert snap.all_directives("permitempty") == []
+
+
+# --------------------------------------------------------------------
 # Weak-algorithms rule
 # --------------------------------------------------------------------
 
