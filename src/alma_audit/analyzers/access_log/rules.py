@@ -218,9 +218,29 @@ def rule_error_rate(
     # AISO-211: the severity decision is driven by the external rate
     # only — that's the operator's "what's the external burst?"
     # question. The total rate stays in the details for transparency.
-    decision_rate = (
-        error_rate_external if error_rate_external is not None else err_rate
-    )
+    #
+    # When ``self_total == 0`` there is no self-IP traffic in the
+    # sample at all, so the external rate IS the total rate — the
+    # ``None`` sentinel emitted by the upstream calculation means
+    # "filter had nothing to do", not "external rate is undefined".
+    # We fall back to ``err_rate`` in that branch so the rule still
+    # surfaces external bursts on hosts that have no localhost traffic
+    # in the access_log (the default for non-cPanel servers).
+    #
+    # When ``self_total > 0`` AND ``external_total == 0`` the sample
+    # is 100% self-IP — cPanel's cpsrvd / monitoring daemon routinely
+    # generates that pattern. The acceptance contract says D4 MUST
+    # NOT emit a finding in that case because there is no external
+    # traffic to score; the operator sees the self-IP distribution
+    # in the forensic JSON (``host_errors_internal_top`` +
+    # ``self_ip_event_count``) instead. We short-circuit: no external
+    # sample → no decision rate → no severity → no finding.
+    if self_total > 0 and external_total <= 0:
+        return []
+    if error_rate_external is not None:
+        decision_rate: float = error_rate_external
+    else:
+        decision_rate = err_rate
     if decision_rate >= settings["error_rate_crit"]:
         sev: Severity | None = Severity.CRITICAL
     elif decision_rate >= settings["error_rate_warn"]:
