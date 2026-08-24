@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify_all.sh — end-to-end verifier for AISO-202..209 feature rollup.
+# verify_all.sh — end-to-end verifier for AISO-202..211 feature rollup.
 #
 # Run after the Developer squad has implemented all 8 tickets. The
 # script checks:
@@ -321,6 +321,8 @@ for analyzer in access_log domlog_inventory modsec_log crawler_verify secure_log
 done
 check "CLI lists new analyzer: ssh_hardening" \
     "echo '$ANALYZER_LIST' | grep -q 'ssh_hardening'"
+check "CLI lists new analyzer: error_log" \
+    "echo '$ANALYZER_LIST' | grep -q 'error_log'"
 
 # ---------------------------------------------------------------------
 # 4. Container integration smoke test — REAL synthetic audit, not just
@@ -458,7 +460,7 @@ fi
 # ---------------------------------------------------------------------
 echo
 echo "============================================================"
-echo "  AISO-202..209 verify_all.sh: $PASS passed, $FAIL failed"
+echo "  AISO-202..211 verify_all.sh: $PASS passed, $FAIL failed"
 echo "============================================================"
 printf '%s\n' "${REPORT[@]}"
 

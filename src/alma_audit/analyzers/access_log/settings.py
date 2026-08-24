@@ -37,6 +37,13 @@ DEFAULT_RULES: dict[str, Any] = {
     # negative disables the cap (the operator opts into unbounded
     # cost). Default 5 mirrors the historic post-AISO-197 window.
     "ip_user_agent_cap": 5,
+    # AISO-211: filter the host's own IPs out of the access_log
+    # per-IP rollups (`top_attackers`, `host_errors_top`, `top_hosts`)
+    # so a cPanel server's self-admin-panel noise doesn't drown the
+    # real external traffic. The forensic JSON still records the
+    # self-IP events for audit. Default ON; flip to False for
+    # diagnostic mode (operators investigating self-noise).
+    "exclude_self_ips": True,
 }
 
 

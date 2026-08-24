@@ -104,6 +104,12 @@ def rule_error_rate(
 ) -> list[Finding]:
     """D4 — 4xx + 5xx burst rate.
 
+    AISO-211: emits TWO error-rate fields so the operator sees both
+    the unfiltered ratio (preserved for backwards compat) AND the
+    localhost-excluded ratio. The severity decision is driven by
+    the external rate only — a cPanel server's self-admin-panel
+    noise would otherwise trip CRITICAL on every audit run.
+
     Without per-host status counts we fall back to top_host. The
     suppression decision is still gated so the contract's "crawler
     claim must come from the burst host" is honored.
@@ -114,22 +120,70 @@ def rule_error_rate(
         c for code, c in agg.status_buckets.items() if 400 <= code < 600
     )
     err_rate = err_count / total_hits
+    # AISO-211: compute the localhost-excluded error rate from the
+    # aggregator's split lists. ``host_errors_top`` (external) and
+    # ``host_errors_internal_top`` (self-IP) are the two halves the
+    # aggregator already partitions in finalize(). When there's no
+    # self-IP traffic at all, the external rate is the same number
+    # as the total rate; we emit ``None`` for the external field in
+    # that case so downstream consumers can distinguish "the filter
+    # had nothing to do" from "filter applied, ratio == total".
+    external_rows: list[dict[str, Any]] = list(summary.get("host_errors_top", []))
+    internal_rows: list[dict[str, Any]] = list(summary.get("host_errors_internal_top", []))
+    # ``total_lines`` from the aggregator equals the sum of every
+    # ``hosts[ip]`` counter (the aggregator also bumps total_lines
+    # for every record, including the malformed ones it skipped).
+    # The external total is total_lines minus whatever self-IP
+    # traffic the aggregator saw. ``internal_rows`` already has
+    # ``total_requests`` for each self-IP, so we sum those to get
+    # the self-IP portion. When internal_rows is empty (no self-IP
+    # traffic at all), external_total == total_lines and we emit
+    # ``None`` for the external field so downstream consumers can
+    # distinguish "filter had nothing to do" from "filter applied,
+    # ratio == total".
+    external_total = total_hits - sum(r["total_requests"] for r in internal_rows)
+    external_err = sum(r["error_count"] for r in external_rows)
+    if external_total > 0 and internal_rows:
+        error_rate_external: float | None = external_err / external_total
+    else:
+        error_rate_external = None
     burst_ua = agg.last_ua_by_host.get(burst_host, "") if burst_host else ""
     d4_suppression = resolve_suppression(resolver, burst_host or "", burst_ua)
     d4_details: dict[str, Any] = {
+        # AISO-211: both fields emitted. ``error_rate`` (the old
+        # name) is preserved for backwards compat with consumers
+        # that were already reading it; new code should read
+        # ``error_rate_total`` / ``error_rate_external``.
         "error_rate": err_rate,
+        "error_rate_total": err_rate,
+        "error_rate_external": error_rate_external,
         "error_count": err_count,
+        "external_error_count": external_err,
+        "external_total_requests": external_total,
         "total": total_hits,
         "status_buckets": summary["status_buckets"],
         "burst_host": burst_host,
         "crawler_suppression": d4_suppression.to_dict(),
         # AISO-197: per-host error breakdown — top 20 hosts by error count.
-        "host_errors_top": summary.get("host_errors_top", []),
+        # AISO-211: `host_errors_top` is preserved as the operator-eye
+        # rollup (external-only). The `host_errors_external_top` +
+        # `host_errors_internal_top` keys are the explicit split for
+        # forensic consumers that want to see the localhost traffic
+        # partition alongside the external one.
+        "host_errors_top": external_rows,
+        "host_errors_external_top": external_rows,
+        "host_errors_internal_top": internal_rows,
         "host_errors_total": summary.get("host_errors_total", 0),
     }
-    if err_rate >= settings["error_rate_crit"]:
+    # AISO-211: the severity decision is driven by the external rate
+    # only — that's the operator's "what's the external burst?"
+    # question. The total rate stays in the details for transparency.
+    decision_rate = (
+        error_rate_external if error_rate_external is not None else err_rate
+    )
+    if decision_rate >= settings["error_rate_crit"]:
         sev: Severity | None = Severity.CRITICAL
-    elif err_rate >= settings["error_rate_warn"]:
+    elif decision_rate >= settings["error_rate_warn"]:
         sev = Severity.WARN
     else:
         sev = None
@@ -152,10 +206,22 @@ def rule_error_rate(
     return [Finding(
         module="access_log",
         severity=sev,
-        title=f"Error rate {err_rate:.1%} ({err_count}/{total_hits})",
+        # AISO-211: the title shows the EXTERNAL rate (the rate that
+        # actually drove the severity decision). When the external
+        # rate is None (no self-IP traffic), fall back to the total
+        # rate for the operator's headline number.
+        title=(
+            f"Error rate {decision_rate:.1%} "
+            f"({external_err}/{external_total} external)"
+            if error_rate_external is not None
+            else f"Error rate {err_rate:.1%} ({err_count}/{total_hits})"
+        ),
         description=(
-            "More than expected 4xx/5xx responses. Either the host is "
-            "being probed, or an upstream service is failing."
+            "More than expected 4xx/5xx responses on external "
+            "traffic. Either an external source is probing, or an "
+            "upstream service is failing. The unfiltered rate is "
+            f"{err_rate:.1%} — cPanel self-admin-panel noise "
+            "explains the gap when localhost traffic is heavy."
         ),
         details=d4_details,
         recommendation="Correlate with error_log to identify the cause.",

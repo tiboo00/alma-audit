@@ -162,11 +162,13 @@ def main(argv: list[str] | None = None) -> int:
         # quick-win analyzers (AISO-186 / GAPS §4) are listed in
         # feature-add order. ``ssh_hardening`` (AISO-209) is the
         # latest addition; it audits the SSH daemon's own config
-        # rather than its log output.
+        # rather than its log output. ``error_log`` (AISO-211) is
+        # the Apache error_log analyzer — opt-in via
+        # ``modules.error_log.enabled``, listed for introspection.
         for name in (
             "access_log", "domlog_inventory", "modsec_log", "crawler_verify",
             "secure_log", "ssl_cert", "cphulk_log", "csf_state",
-            "ssh_hardening",
+            "ssh_hardening", "error_log",
         ):
             print(name)
         return 0

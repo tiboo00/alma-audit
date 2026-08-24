@@ -89,6 +89,14 @@ modules:
     # rollup bound. Negative disables the cap (operator opts into
     # unbounded cost on UA-diverse per-IP traffic).
     ip_user_agent_cap: 5
+    # AISO-211: filter the host's own IPs out of the access_log
+    # per-IP rollups (`top_attackers`, `host_errors_top`, `top_hosts`)
+    # so a cPanel server's self-admin-panel noise doesn't drown the
+    # real external traffic. The forensic JSON keeps the self-IP
+    # events (`self_ip_event_count` / `self_ip_examples`) for audit.
+    # Default ON; flip to False for diagnostic mode (operators
+    # investigating their own self-noise).
+    exclude_self_ips: true
 
   domlog_inventory:
     max_entries: 1000
@@ -118,6 +126,24 @@ modules:
     # preserves the historical "any single CRITICAL match fires"
     # behaviour; raise this on noisy test hosts.
     critical_hit_count: 1
+
+  # AISO-211: Apache error_log analyzer. Parses the per-line module
+  # + PID + client IP log and surfaces per-client error counts +
+  # top error message templates. CRITICAL fires when a single host
+  # repeats the same message `message_burst_crit` times (default
+  # 100) — the AISO-211 §3 contract signature for mpm_prefork OOM
+  # loops, repeated SSL handshake failures, or scripted 404-spam.
+  # OPT-IN: default is `false` to keep the audit scope unchanged
+  # for hosts that don't have an error_log (or operators who haven't
+  # explicitly opted in). When disabled, the analyzer returns []
+  # silently — no INFO finding.
+  error_log:
+    enabled: false
+    top_clients_limit: 10
+    top_messages_limit: 10
+    message_burst_crit: 100
+    max_files: 20
+    max_lines_per_file: 200000
 
   # --- AISO-186 quick-win analyzers ---
 

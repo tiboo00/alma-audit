@@ -34,6 +34,7 @@ def analyze_access_logs(
     fs: FileSystem,
     rules: dict[str, Any] | None = None,
     resolver: Resolver | None = None,
+    self_ips: set[str] | None = None,
 ) -> list[Finding]:
     """Run the access-log analyzer across `paths` and emit findings.
 
@@ -41,6 +42,13 @@ def analyze_access_logs(
     real `SocketResolver` (3-second timeouts per the §6.1 contract);
     tests inject a `FakeResolver`. The default is `SocketResolver`,
     so a missing argument stays fail-closed and time-bounded.
+
+    AISO-211: `self_ips` is the host's own IP set (auto-detected +
+    operator allowlist). When the operator has NOT explicitly set
+    `modules.access_log.exclude_self_ips: false`, the orchestrator
+    passes the set into the aggregator so cPanel self-noise doesn't
+    drown the per-IP rollups. The forensic JSON still records the
+    self-IP events for audit.
     """
     settings = {**DEFAULT_RULES, **(rules or {})}
     # A `max_lines_per_file` of 0 (or negative) disables the cap.
@@ -63,7 +71,16 @@ def analyze_access_logs(
         ip_ua_cap = -1  # 0 also means "no cap" by operator convention.
     else:
         ip_ua_cap = int(raw_ua_cap)
-    agg = AccessAggregator(ip_user_agent_cap=ip_ua_cap)
+    # AISO-211: only filter self-IPs when the operator hasn't disabled
+    # the feature. ``exclude_self_ips`` defaults to True; flip to
+    # False for diagnostic mode.
+    effective_self_ips: set[str] = (
+        (self_ips or set()) if settings.get("exclude_self_ips", True) else set()
+    )
+    agg = AccessAggregator(
+        ip_user_agent_cap=ip_ua_cap,
+        self_ips=effective_self_ips,
+    )
     files_scanned = 0
     files_truncated: list[str] = []
     # Track if the file we are reading is itself an issue — e.g.
