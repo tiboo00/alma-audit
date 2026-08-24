@@ -252,6 +252,101 @@ def test_cloudflare_payloads_handle_all_local_gracefully():
     assert "127.0.0.1" in payloads[0]["_filtered_local_ips"]
 
 
+def test_cloudflare_payloads_chunk_above_threshold():
+    """AISO-202: Cloudflare's ~4 KiB expression ceiling forces chunking.
+
+    Feed 1100 unique scanner IPs and expect exactly 3 payloads (one per
+    chunk), with sizes 500 / 500 / 100. Every payload must:
+      - carry `_chunk` (1-indexed) and `_chunk_total` keys,
+      - keep `_category` shared across the three,
+      - render `(chunk N/M)` in the description,
+      - emit at most _CHUNK_SIZE entries in its `expression`.
+    """
+    findings = [_finding_with_details({
+        "top_attackers": [
+            {"ip": f"203.0.113.{i}", "total_probe_requests": 1100 - i,
+             "total_requests": 1100 - i,
+             "probe_paths": {"/.env": 1100 - i}, "first_seen": "", "last_seen": "",
+             "user_agents": []}
+            for i in range(1100)
+        ],
+    })]
+    payloads = build_cloudflare_block_payloads(findings)
+    # 1100 >= min_ips=3, so we get the scanner category chunked.
+    scanner_payloads = [p for p in payloads if p.get("_category", "").startswith("scanner")]
+    assert len(scanner_payloads) == 3, f"Expected 3 chunked payloads, got {len(scanner_payloads)}"
+
+    sizes = [p["_count"] for p in scanner_payloads]
+    assert sizes == [500, 500, 100], f"Expected 500/500/100 split, got {sizes}"
+
+    # Each chunk must carry _chunk / _chunk_total and stay under the cap.
+    for p in scanner_payloads:
+        assert p["_chunk_total"] == 3
+        assert p["_chunk"] in (1, 2, 3)
+        assert p["_count"] <= 500
+        # Cloudflare expression must be well-formed.
+        assert p["expression"].startswith("(ip.src in {")
+        assert p["expression"].endswith("})")
+        # Description must carry the chunk suffix when M > 1.
+        m = p["_chunk"]
+        assert f"(chunk {m}/3)" in p["description"], (
+            f"Missing '(chunk {m}/3)' in description: {p['description']!r}"
+        )
+
+    # No overlap between chunks — every IP must appear exactly once
+    # across the three expressions (sorted-count tie-break: highest
+    # counts land in chunk 1).
+    seen_ips: set[str] = set()
+    for p in scanner_payloads:
+        chunk_ips = set(p["expression"][len("(ip.src in {"):-2].split())
+        assert chunk_ips.isdisjoint(seen_ips), "Chunk IPs overlap"
+        seen_ips.update(chunk_ips)
+    assert len(seen_ips) == 1100
+
+
+def test_cloudflare_payloads_no_chunk_suffix_when_single_chunk():
+    """AISO-202: a single-chunk rule stays as-is (no '(chunk 1/1)').
+
+    The suffix is only meaningful when M > 1. Dashboards and existing
+    grep filters that key off the description must not have to
+    special-case '(chunk 1/1)'.
+    """
+    findings = [_finding_with_details({
+        "top_attackers": [
+            {"ip": f"1.2.3.{i}", "total_probe_requests": i + 1, "total_requests": 10,
+             "probe_paths": {"/.env": i + 1}, "first_seen": "", "last_seen": "",
+             "user_agents": []}
+            for i in range(5)
+        ],
+    })]
+    payloads = build_cloudflare_block_payloads(findings)
+    scanner = [p for p in payloads if p.get("_category", "").startswith("scanner")]
+    assert len(scanner) == 1
+    assert "chunk" not in scanner[0]["description"].lower()
+    assert scanner[0]["_chunk"] == 1
+    assert scanner[0]["_chunk_total"] == 1
+
+
+def test_cloudflare_curl_script_emits_one_curl_per_chunk():
+    """AISO-202: chunking must produce one curl per chunk in order."""
+    findings = [_finding_with_details({
+        "top_attackers": [
+            {"ip": f"203.0.113.{i}", "total_probe_requests": 1100 - i,
+             "total_requests": 1,
+             "probe_paths": {"/.env": 1}, "first_seen": "", "last_seen": "",
+             "user_agents": []}
+            for i in range(1100)
+        ],
+    })]
+    payloads = build_cloudflare_block_payloads(findings)
+    script = build_cloudflare_curl_script(payloads)
+    # Exactly 3 curl POSTs (one per chunk of the scanner category).
+    assert script.count("curl -fsS -X POST") == 3
+    # Each chunk label must appear in both the comment and the echo.
+    for n in (1, 2, 3):
+        assert f"chunk {n}/3" in script, f"chunk {n}/3 not in script"
+
+
 def test_forensic_export_keeps_local_ips_in_json():
     """Local IPs ARE filtered from Cloudflare but KEPT in the forensic JSON.
 
@@ -286,3 +381,306 @@ def test_forensic_export_keeps_local_ips_in_json():
     assert "127.0.0.1" not in cf_ips
     for i in range(5):
         assert f"8.8.4.{i}" in cf_ips
+
+
+# ---------------------------------------------------------------------------
+# AISO-202 — Cloudflare payload chunking (max 500 entries / rule)
+# ---------------------------------------------------------------------------
+
+
+def _row(ip: str, count: int = 1) -> dict:
+    """Compact top_attackers row used by the chunking tests."""
+    return {
+        "ip": ip,
+        "total_probe_requests": count,
+        "total_requests": count,
+        "probe_paths": {"/.env": count},
+        "first_seen": "",
+        "last_seen": "",
+        "user_agents": [],
+    }
+
+
+def _ips_in_expression(expr: str) -> list[str]:
+    """Extract the space-separated IPs from a CF expression.
+
+    Strips the literal `(ip.src in {` prefix and trailing `})` so callers
+    get back a clean list. Used to assert no-drops / no-dupes across
+    chunks.
+    """
+    assert expr.startswith("(ip.src in {") and expr.endswith("})"), expr
+    body = expr[len("(ip.src in {"):-len("})")]
+    return body.split()
+
+
+def _external_ips(count: int) -> list[str]:
+    """Generate `count` distinct non-local IPs.
+
+    Uses the public 8.0.0.0/8 block (8.0.0.0–8.255.255.255 = 16M+ IPs)
+    which is NOT in the `_LOCAL_NETWORKS` filter, so every IP survives
+    `build_cloudflare_block_payloads` and lands in the chunks.
+    """
+    import ipaddress
+    from alma_audit.forensic_export import _is_local_ip
+    ips: list[str] = []
+    net = ipaddress.ip_network("8.0.0.0/8")
+    for ip in net:
+        if len(ips) >= count:
+            break
+        if not _is_local_ip(str(ip)):
+            ips.append(str(ip))
+    assert len(ips) == count, f"only generated {len(ips)}/{count}"
+    return ips
+
+
+def test_cloudflare_chunking_empty_findings_emits_no_payloads():
+    """Empty findings → no payloads, no no-op sentinel, no crash.
+
+    Edge case for the chunking path: with no categories populated,
+    every `_emit_chunked` returns early. The function must return `[]`
+    so the curl script / forensic JSON cleanly says "nothing to block".
+    """
+    payloads = build_cloudflare_block_payloads([])
+    assert payloads == []
+
+
+def test_cloudflare_chunking_below_min_ips_emits_no_payload():
+    """1 IP for a category (below min_ips=3) → no payload, no chunks.
+
+    Edge case: the chunking loop must never run when there aren't
+    enough IPs to warrant a rule in the first place.
+    """
+    findings = [_finding_with_details({"top_attackers": [_row("1.2.3.4")]}),
+                _finding_with_details({"ssh_fail_details": [
+                    {"ip": "5.6.7.8", "user": "root", "count": 5,
+                     "first_seen": "", "last_seen": ""},
+                ]})]
+    payloads = build_cloudflare_block_payloads(findings)
+    assert payloads == []
+
+
+def test_cloudflare_chunking_small_input_single_chunk_no_suffix():
+    """'Small but valid' input (3 IPs, well below 500) → 1 chunk, no suffix.
+
+    A single-chunk rule must NOT carry the `(chunk 1/1)` suffix so
+    existing dashboards / grep filters don't have to special-case it.
+    """
+    findings = [_finding_with_details({
+        "top_attackers": [_row(f"1.2.3.{i}", count=i + 1) for i in range(3)],
+    })]
+    payloads = build_cloudflare_block_payloads(findings)
+    # Exactly one scanner payload.
+    scanner_payloads = [p for p in payloads if "scanner" in p.get("_category", "")]
+    assert len(scanner_payloads) == 1
+    p = scanner_payloads[0]
+    assert p["_chunk"] == 1
+    assert p["_chunk_total"] == 1
+    assert "(chunk" not in p["description"]
+    assert _ips_in_expression(p["expression"]) == [
+        "1.2.3.2", "1.2.3.1", "1.2.3.0",  # count desc: 3, 2, 1
+    ]
+
+
+def test_cloudflare_chunking_exactly_chunk_boundary_single_payload():
+    """Exactly 500 IPs → 1 payload, no chunk suffix, all 500 present.
+
+    Boundary case: 500 must NOT split. The chunking loop's `start:start+500`
+    slice yields the whole list as a single chunk, with no `(chunk 1/1)`
+    noise in the description.
+    """
+    # 500 distinct external IPs in 8.0.0.0/8 — survives the local-IP
+    # filter (`_is_local_ip` doesn't reject 8/8) and gives every IP a
+    # unique value so no count-desc tie-breaks pollute the assertion.
+    ips = _external_ips(500)
+    findings = [_finding_with_details({
+        "top_attackers": [_row(ip, count=1) for ip in ips],
+    })]
+    payloads = build_cloudflare_block_payloads(findings)
+    scanner_payloads = [p for p in payloads if "scanner" in p.get("_category", "")]
+    assert len(scanner_payloads) == 1
+    p = scanner_payloads[0]
+    assert p["_chunk"] == 1
+    assert p["_chunk_total"] == 1
+    assert p["_count"] == 500
+    assert "(chunk" not in p["description"]
+    emitted = _ips_in_expression(p["expression"])
+    assert len(emitted) == 500
+    assert emitted == sorted(emitted)  # 500 IPs with equal count → alpha
+    assert set(emitted) == set(ips)  # no drops, no dupes
+
+
+def test_cloudflare_chunking_just_over_chunk_boundary_splits_into_two():
+    """501 IPs → 2 chunks: first has 500, second has 1.
+
+    Boundary case: the 501st IP must trigger a new chunk, not silently
+    overflow the first. This is the off-by-one boundary — the chunking
+    loop's `start + _CHUNK_SIZE` slice must produce exactly 500+1.
+    """
+    ips = _external_ips(501)
+    findings = [_finding_with_details({
+        "top_attackers": [_row(ip, count=1) for ip in ips],
+    })]
+    payloads = build_cloudflare_block_payloads(findings)
+    scanner_payloads = sorted(
+        [p for p in payloads if "scanner" in p.get("_category", "")],
+        key=lambda p: p["_chunk"],
+    )
+    assert len(scanner_payloads) == 2
+    first, second = scanner_payloads
+    # First chunk is the boundary case: exactly 500 entries.
+    assert first["_count"] == 500
+    assert first["_chunk"] == 1
+    assert first["_chunk_total"] == 2
+    assert "(chunk 1/2)" in first["description"]
+    # Second chunk carries the overflow: just 1 entry.
+    assert second["_count"] == 1
+    assert second["_chunk"] == 2
+    assert second["_chunk_total"] == 2
+    assert "(chunk 2/2)" in second["description"]
+    # Union of chunks == original list (no drops, no dupes).
+    union = _ips_in_expression(first["expression"]) + _ips_in_expression(second["expression"])
+    assert len(union) == 501
+    assert set(union) == set(ips)
+    # Chunks must be disjoint.
+    assert not (set(_ips_in_expression(first["expression"]))
+                & set(_ips_in_expression(second["expression"])))
+
+
+def test_cloudflare_chunking_multi_chunk_preserves_global_order():
+    """1,250 IPs → 3 chunks (500/500/250), preserving the global sort order.
+
+    Across chunks, the top-N sorting (count desc, then alpha) must be
+    respected — the union of chunk expressions must equal the
+    globally-sorted original list with no gaps and no overlap.
+    """
+    ips = _external_ips(1250)
+    findings = [_finding_with_details({
+        "top_attackers": [_row(ip, count=1) for ip in ips],
+    })]
+    payloads = build_cloudflare_block_payloads(findings)
+    scanner_payloads = sorted(
+        [p for p in payloads if "scanner" in p.get("_category", "")],
+        key=lambda p: p["_chunk"],
+    )
+    assert len(scanner_payloads) == 3
+    sizes = [p["_count"] for p in scanner_payloads]
+    assert sizes == [500, 500, 250]
+    for idx, p in enumerate(scanner_payloads, start=1):
+        assert p["_chunk"] == idx
+        assert p["_chunk_total"] == 3
+        assert f"(chunk {idx}/3)" in p["description"]
+    # Reassemble and verify ordering matches the global sort.
+    reassembled: list[str] = []
+    for p in scanner_payloads:
+        reassembled.extend(_ips_in_expression(p["expression"]))
+    expected_sorted = sorted(ips)  # all count=1 → pure alpha sort
+    assert reassembled == expected_sorted
+    # No drops, no dupes.
+    assert len(reassembled) == len(set(reassembled)) == 1250
+
+
+def test_cloudflare_chunking_across_categories_no_bleeding():
+    """scanner + brute-force chunking operate independently.
+
+    The scanner and SSH brute-force categories must NOT share chunks
+    or bleed into each other's payloads. Both can chunk independently.
+    """
+    scanner_ips = _external_ips(600)  # 2 chunks (500 + 100)
+    # Pull SSH IPs from a disjoint slice of the same external pool —
+    # avoids depending on a fixed prefix scheme.
+    ssh_ips = _external_ips(700)[600:650]  # 50 IPs, disjoint from scanner_ips
+
+    def _ssh_row(ip: str) -> dict:
+        return {"ip": ip, "user": "root", "count": 1,
+                "first_seen": "", "last_seen": ""}
+
+    findings = [_finding_with_details({
+        "top_attackers": [_row(ip) for ip in scanner_ips],
+        "ssh_fail_details": [_ssh_row(ip) for ip in ssh_ips],
+    })]
+    payloads = build_cloudflare_block_payloads(findings)
+    by_cat: dict[str, list[dict]] = {}
+    for p in payloads:
+        by_cat.setdefault(p["_category"], []).append(p)
+    # Scanner: 2 chunks (600 IPs / 500).
+    scanner_payloads = sorted(by_cat.get("scanner IPs (probe paths)", []),
+                              key=lambda p: p["_chunk"])
+    assert len(scanner_payloads) == 2
+    assert scanner_payloads[0]["_count"] == 500
+    assert scanner_payloads[1]["_count"] == 100
+    assert scanner_payloads[0]["_chunk_total"] == 2
+    # SSH: 1 chunk (50 IPs, below 500).
+    ssh_payloads = by_cat.get("brute-force IPs (SSH)", [])
+    assert len(ssh_payloads) == 1
+    assert ssh_payloads[0]["_count"] == 50
+    assert ssh_payloads[0]["_chunk_total"] == 1
+    assert "(chunk" not in ssh_payloads[0]["description"]
+    # Scanner chunks must contain only scanner IPs, not SSH IPs.
+    scanner_set = set(scanner_ips)
+    ssh_set = set(ssh_ips)
+    for p in scanner_payloads:
+        ips_in = _ips_in_expression(p["expression"])
+        # Scanner chunk must be a subset of the scanner IP set.
+        assert set(ips_in) <= scanner_set
+        # SSH IPs must not appear in scanner chunks.
+        assert ssh_set.isdisjoint(ips_in)
+    # And the SSH chunk must not contain scanner IPs.
+    ssh_in = _ips_in_expression(ssh_payloads[0]["expression"])
+    assert set(ssh_in) <= ssh_set
+    assert scanner_set.isdisjoint(ssh_in)
+
+
+def test_cloudflare_chunking_no_drops_no_duplicates_across_chunks():
+    """Property: union of chunk IPs == original IP set, |union| == |original|.
+
+    A direct property-style check: generate a larger random set of
+    IPs, verify the chunking preserves cardinality and uniqueness.
+    """
+    import random
+    rng = random.Random(42)  # deterministic
+    # 1234 distinct external IPs — large enough to span 3 chunks.
+    ips = _external_ips(1234)
+    findings = [_finding_with_details({
+        "top_attackers": [_row(ip, count=rng.randint(1, 100)) for ip in ips],
+    })]
+    payloads = build_cloudflare_block_payloads(findings)
+    scanner_payloads = sorted(
+        [p for p in payloads if "scanner" in p.get("_category", "")],
+        key=lambda p: p["_chunk"],
+    )
+    # 1234 / 500 = 3 chunks (500, 500, 234).
+    assert len(scanner_payloads) == 3
+    union: list[str] = []
+    for p in scanner_payloads:
+        union.extend(_ips_in_expression(p["expression"]))
+    # No drops: every original IP appears in exactly one chunk.
+    # NOTE: set comparison — `ips` is in numeric (network) order from
+    # `_external_ips`'s `ipaddress.ip_network` iteration, but the chunk
+    # assembly emits in count-desc-then-alpha order, so position-wise
+    # equality of sorted lists is not a useful invariant. The
+    # cardinality check below is the real property.
+    assert set(union) == set(ips)
+    # No duplicates: chunk cardinality == original cardinality.
+    assert len(union) == len(ips)
+
+
+def test_cloudflare_chunking_curl_script_emits_one_curl_per_chunk():
+    """build_cloudflare_curl_script emits one curl line per chunk.
+
+    The script-level wiring: each chunk payload produces one POST
+    in the generated script. The operator's workflow is unchanged —
+    they run `bash cloudflare-block.sh` and it iterates the chunks
+    transparently.
+    """
+    ips = _external_ips(1250)
+    findings = [_finding_with_details({
+        "top_attackers": [_row(ip) for ip in ips],
+    })]
+    payloads = build_cloudflare_block_payloads(findings)
+    script = build_cloudflare_curl_script(payloads)
+    # One curl per payload (chunk), regardless of how many chunks.
+    assert script.count("curl -fsS -X POST") == len(payloads)
+    # The chunk-N/M metadata lands in the script's comment lines.
+    assert "(chunk 1/3)" in script
+    assert "(chunk 2/3)" in script
+    assert "(chunk 3/3)" in script

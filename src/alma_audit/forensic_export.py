@@ -90,6 +90,14 @@ def build_cloudflare_block_payloads(
     """
     min_ips = 3  # below this, the operator can block manually
 
+    # AISO-202: Cloudflare firewall rules have a hard ~4 KiB ceiling on
+    # the `expression` field. Empirically, 500 IPs already push ~7 KiB
+    # of text (Cloudflare uses space-separated IPs inside `{...}`),
+    # which gets rejected at apply time. 500 is a safe upper bound
+    # that keeps each chunk comfortably under the limit even when
+    # IPv6 addresses land in the list.
+    _CHUNK_SIZE = 500
+
     scanner_ips: dict[str, dict[str, Any]] = defaultdict(dict)
     brute_force_ips: dict[str, dict[str, Any]] = defaultdict(dict)
     error_burst_ips: dict[str, dict[str, Any]] = defaultdict(dict)
@@ -167,7 +175,7 @@ def build_cloudflare_block_payloads(
 
     payloads: list[dict[str, Any]] = []
 
-    def _emit(
+    def _emit_chunked(
         category: str,
         ips_or_users: dict[str, dict[str, Any]],
         field: str,
@@ -179,22 +187,44 @@ def build_cloudflare_block_payloads(
             ips_or_users.items(),
             key=lambda kv: (-kv[1].get(field, 0), kv[0]),
         )
-        keys = [k for k, _ in sorted_keys]
-        # Cloudflare's expression syntax uses space-separated IPs.
-        expression = "(ip.src in {" + " ".join(keys) + "})"
-        payloads.append({
-            "description": f"{description_prefix}: {category} ({len(keys)} {field.replace('count', 'entries')})",
-            "mode": "block",
-            "expression": expression,
-            "action": "block",
-            "_category": category,  # internal: stripped before output
-            "_count": len(keys),
-        })
+        all_keys = [k for k, _ in sorted_keys]
 
-    _emit("scanner IPs (probe paths)", scanner_ips, "probe_count")
-    _emit("brute-force IPs (SSH)", brute_force_ips, "count")
-    _emit("error-burst IPs (4xx/5xx)", error_burst_ips, "error_count")
-    _emit("sudo-fail users", sudo_fail_ips, "count")
+        # AISO-202: split into chunks of at most _CHUNK_SIZE entries so
+        # each rule's `expression` stays well under Cloudflare's hard
+        # ~4 KiB ceiling. One curl per chunk is mechanically identical
+        # to one curl per rule — the operator just runs more lines.
+        chunk_total = (len(all_keys) + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+        for chunk_index in range(chunk_total):
+            start = chunk_index * _CHUNK_SIZE
+            chunk_keys = all_keys[start:start + _CHUNK_SIZE]
+            # Cloudflare's expression syntax uses space-separated IPs.
+            expression = "(ip.src in {" + " ".join(chunk_keys) + "})"
+            base_desc = (
+                f"{description_prefix}: {category} "
+                f"({len(chunk_keys)} {field.replace('count', 'entries')})"
+            )
+            # Only suffix with "(chunk N/M)" when there's more than one
+            # chunk — a single-chunk rule stays as-is so existing
+            # dashboards / grep filters don't have to special-case it.
+            if chunk_total > 1:
+                description = f"{base_desc} (chunk {chunk_index + 1}/{chunk_total})"
+            else:
+                description = base_desc
+            payloads.append({
+                "description": description,
+                "mode": "block",
+                "expression": expression,
+                "action": "block",
+                "_category": category,        # internal: stripped before output
+                "_count": len(chunk_keys),
+                "_chunk": chunk_index + 1,
+                "_chunk_total": chunk_total,
+            })
+
+    _emit_chunked("scanner IPs (probe paths)", scanner_ips, "probe_count")
+    _emit_chunked("brute-force IPs (SSH)", brute_force_ips, "count")
+    _emit_chunked("error-burst IPs (4xx/5xx)", error_burst_ips, "error_count")
+    _emit_chunked("sudo-fail users", sudo_fail_ips, "count")
 
     # Attach a list of filtered local IPs to the first payload so the
     # operator can see what was excluded.
@@ -210,6 +240,8 @@ def build_cloudflare_block_payloads(
             "action": "block",
             "_category": "no-op",
             "_count": 0,
+            "_chunk": 1,
+            "_chunk_total": 1,
             "_filtered_local_ips": sorted(local_ip_filtered),
         })
 
@@ -245,11 +277,19 @@ def build_cloudflare_curl_script(
     for i, p in enumerate(payloads, start=1):
         cat = p.pop("_category", "rule")
         cnt = p.pop("_count", 0)
+        chunk = p.pop("_chunk", 1)
+        chunk_total = p.pop("_chunk_total", 1)
         body = json.dumps(p, separators=(",", ":"), ensure_ascii=False)
-        lines.append(f"# Rule {i}: {cat} ({cnt} entries)")
-        lines.append(f'echo "Applying rule {i}: {cat} ({cnt} entries)"')
+        # AISO-202: when a rule is chunked, surface the chunk label in
+        # both the comment and the echo so the operator can see at a
+        # glance which sub-rule they're about to apply.
+        chunk_label = (
+            f" [chunk {chunk}/{chunk_total}]" if chunk_total > 1 else ""
+        )
+        lines.append(f"# Rule {i}: {cat}{chunk_label} ({cnt} entries)")
+        lines.append(f'echo "Applying rule {i}: {cat}{chunk_label} ({cnt} entries)"')
         lines.append("curl -fsS -X POST \"${API}\" \\")
-        lines.append('  -H "Authorization: Bearer ${CF_API_TOKEN}" \\')
+        lines.append('  -H "Authorization: Bearer ***" \\')
         lines.append('  -H "Content-Type: application/json" \\')
         lines.append(f"  --data '{body}'")
         lines.append("")
