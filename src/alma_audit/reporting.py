@@ -326,18 +326,35 @@ def _render_cloudflare_appendix(lines: list[str], report: AuditReport) -> None:
         if len(filtered) > 20:
             lines.append(f"  - _... and {len(filtered) - 20} more_")
         lines.append("")
+    # AISO-202: when a category produces multiple chunks (a rule with
+    # > 500 IPs), group the per-chunk sub-headings under a single
+    # category heading so the operator can see at a glance that the
+    # 4-rule list "scanner IPs (probe paths)" is really one logical
+    # blocklist split for Cloudflare's 4 KiB ceiling, not 4 unrelated
+    # blocks. Each chunk still gets its own JSON dump + rule number.
+    last_category: str | None = None
     for i, p in enumerate(payloads, start=1):
         cat = p.get("_category", f"rule {i}")
         cnt = p.get("_count", 0)
+        chunk = p.get("_chunk", 1)
+        chunk_total = p.get("_chunk_total", 1)
+        # Emit a category heading the first time we see this category,
+        # and a smaller "Rule N: chunk N/M" sub-heading for each chunk.
+        if cat != last_category:
+            if chunk_total > 1:
+                lines.append(f"### {cat} (split into {chunk_total} chunks)")
+            else:
+                lines.append(f"### {cat}")
+            lines.append("")
+            last_category = cat
         if not p.get("expression"):
             # No-op payload (everything was local). Skip the JSON
             # dump — the "local IP filter" section above already covers
             # it.
-            lines.append(f"### Rule {i}: {cat}")
-            lines.append("")
             lines.append(
-                "_No external IPs to block — every suspicious source was "
-                "filtered out as local / private / loopback (see list above)._"
+                "_No external IPs to block — every suspicious source "
+                "was filtered out as local / private / loopback "
+                "(see list above)._"
             )
             lines.append("")
             continue
@@ -345,7 +362,12 @@ def _render_cloudflare_appendix(lines: list[str], report: AuditReport) -> None:
             {k: v for k, v in p.items() if not k.startswith("_")},
             indent=2, ensure_ascii=False,
         )
-        lines.append(f"### Rule {i}: {cat} ({cnt} entries)")
+        if chunk_total > 1:
+            lines.append(
+                f"**Rule {i} — chunk {chunk}/{chunk_total} ({cnt} entries):**"
+            )
+        else:
+            lines.append(f"**Rule {i} ({cnt} entries):**")
         lines.append("")
         lines.append("```json")
         lines.append(body)
