@@ -23,10 +23,16 @@ regardless of what ``/var/log/secure`` shows.
 
 Layout (per GAPS §7.3 standard pattern):
     parser.py      — line → SshdDirective, with ``Match`` blocks skipped
-    aggregator.py  — last-wins snapshot (drop-ins override main)
+    aggregator.py  — first-obtained-wins snapshot (per ``sshd_config(5)``),
+                     additive only for the small whitelist of directives
+                     that OpenSSH itself appends across occurrences
+                     (Port, AllowUsers, AllowGroups, DenyUsers,
+                     DenyGroups, AcceptEnv, ListenAddress)
     rules.py       — one rule per directive, severity per AISO-209 §3
     settings.py    — DEFAULT_RULES thresholds + known-directive set
-    analyzer.py    — public ``analyze_ssh_config`` orchestrator
+    analyzer.py    — public ``analyze_ssh_config`` orchestrator,
+                     walks the ``Include`` graph inline (lex-sorted
+                     at each Include directive's position)
 
 Tests live in ``tests/test_ssh_hardening.py``.
 """

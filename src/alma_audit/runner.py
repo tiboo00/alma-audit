@@ -251,11 +251,31 @@ def run_analyzers(cfg: Config, fs: FileSystem) -> list[Finding]:
     # password auth, default port, weak algorithms, ...). Reads via
     # the injected FileSystem; emits its own INFO finding when the
     # config / drop-ins are missing.
+    #
+    # AISO-209 also accepted the spec'd YAML override
+    # ``modules.ssh_hardening.config_path`` (the issue text). The
+    # ``paths.ssh_config_path`` key shipped in the original PR stays
+    # valid for backward compatibility — ``paths.*`` is read first,
+    # then the module-level key wins if present. Operators that don't
+    # care about module-level organisation can keep their YAML flat.
+    ssh_hardening_rules = dict(cfg.modules.get("ssh_hardening", {}) or {})
+    module_config_path = ssh_hardening_rules.pop("config_path", None)
+    ssh_config_path = (
+        module_config_path
+        if isinstance(module_config_path, str) and module_config_path
+        else cfg.paths.ssh_config_path
+    )
+    module_drop_in_dir = ssh_hardening_rules.pop("drop_in_dir", None)
+    ssh_drop_in_dir = (
+        module_drop_in_dir
+        if isinstance(module_drop_in_dir, str) and module_drop_in_dir
+        else cfg.paths.ssh_drop_in_dir
+    )
     findings.extend(analyze_ssh_config(
         fs,
-        config_path=cfg.paths.ssh_config_path,
-        drop_in_dir=cfg.paths.ssh_drop_in_dir,
-        rules=cfg.modules.get("ssh_hardening", {}),
+        config_path=ssh_config_path,
+        drop_in_dir=ssh_drop_in_dir,
+        rules=ssh_hardening_rules,
     ))
 
     return findings

@@ -108,17 +108,23 @@ Built-in rules (see `src/alma_audit/analyzers/*.py` for thresholds):
   `deny_count_crit`; optional growth/shrinkage deltas against an
   operator-provided baseline.
 - **ssh_hardening** (AISO-209) — `/etc/ssh/sshd_config` (plus
-  `sshd_config.d/*.conf` drop-ins, concatenated in alphabetical
-  order to match OpenSSH `Include` semantics) audit. CRITICAL on
-  `PermitRootLogin yes`, `PermitEmptyPasswords yes`, or `Protocol
-  1` enabled; WARN on `PasswordAuthentication yes`, default port
-  22, `MaxAuthTries > 6`, `ClientAliveInterval 0`,
+  `sshd_config.d/*.conf` drop-ins, expanded inline at each
+  `Include` directive's position via lex-sorted glob) audit.
+  Applies OpenSSH's first-obtained-wins rule for every scalar
+  directive (``sshd_config(5)``: "for each keyword, the first
+  obtained value will be used"). CRITICAL on `PermitRootLogin
+  yes`, `PermitEmptyPasswords yes`, or `Protocol 1` enabled;
+  WARN on `PasswordAuthentication yes`, default port 22,
+  `MaxAuthTries > 6`, `ClientAliveInterval 0`,
   `LoginGraceTime > 120`, missing `AllowUsers` / `AllowGroups`,
   and weak `Ciphers` / `MACs`; INFO on `X11Forwarding yes`,
   `PermitRootLogin prohibit-password`, and missing `Banner`.
   Override the path via `--ssh-config PATH` /
-  `--ssh-drop-in-dir DIR` (CLI) or
-  `paths.ssh_config_path` / `paths.ssh_drop_in_dir` (YAML).
+  `--ssh-drop-in-dir DIR` (CLI), `paths.ssh_config_path` /
+  `paths.ssh_drop_in_dir` (YAML — backward compat), or the
+  issue-spec `modules.ssh_hardening.config_path` /
+  `modules.ssh_hardening.drop_in_dir` (YAML — wins over
+  `paths.*`).
 
 ## Trend sidecar
 

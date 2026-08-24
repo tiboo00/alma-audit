@@ -175,6 +175,16 @@ modules:
   # Ciphers / MACs as WARN; X11Forwarding yes / no Banner /
   # PermitRootLogin prohibit-password as INFO. Thresholds:
   ssh_hardening:
+    # ``modules.ssh_hardening.config_path`` (the issue-spec key)
+    # overrides ``paths.ssh_config_path`` for this module only.
+    # The default (``/etc/ssh/sshd_config``) is the right answer
+    # for nearly every host — set this only when sshd lives under
+    # a non-standard location (e.g. chroot, container, custom
+    # build). ``drop_in_dir`` is the matching drop-in directory;
+    # if only ``config_path`` is set, the analyzer derives
+    # ``drop_in_dir`` as ``<parent of config_path>/sshd_config.d``.
+    # config_path: /etc/ssh/sshd_config
+    # drop_in_dir: /etc/ssh/sshd_config.d
     # `MaxAuthTries` greater than this is a WARN.
     # 6 matches the CIS Benchmark upper bound.
     max_auth_tries_warn: 6

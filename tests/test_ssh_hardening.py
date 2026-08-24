@@ -120,8 +120,8 @@ def test_parser_keyword_case_insensitive_but_values_preserved():
     d = directives[0]
     # Keyword is preserved verbatim.
     assert d.keyword == "permitrootlogin"
-    # Values are preserved verbatim too — the aggregator case-folds
-    # for the last-wins dict.
+    # Values are preserved verbatim too — the aggregator stores
+    # under the lowercased keyword for first-obtained-wins lookup.
     assert d.values == ("YES",)
 
 
@@ -247,22 +247,87 @@ def test_strong_fixture_infos_are_expected():
 
 
 # --------------------------------------------------------------------
-# Drop-in handling — last-wins, alphabetical order
+# Drop-in handling — first-obtained-wins, alphabetical order
 # --------------------------------------------------------------------
 
 
-def test_drop_in_overrides_main_config():
-    """A drop-in that says ``PermitRootLogin no`` after the main
-    file's ``PermitRootLogin yes`` must suppress the CRITICAL
-    finding (last-wins semantics, matching OpenSSH)."""
+def test_drop_in_does_not_override_main_config():
+    """A drop-in that re-states ``PermitRootLogin no`` AFTER the main
+    file's ``PermitRootLogin yes`` does NOT suppress the CRITICAL
+    finding — per ``sshd_config(5)``, "for each keyword, the first
+    obtained value will be used." This is the OpenSSH
+    first-obtained-wins rule.
+
+    Drop-ins only override main-file settings when the main file is
+    silent on the directive.
+
+    The fixture mirrors a distro-style layout: the main file
+    declares ``Include /etc/ssh/sshd_config.d/*.conf`` at the top
+    (which is where OpenSSH actually puts it on every modern
+    distro). The drop-in is then spliced IN at that position —
+    BEFORE ``PermitRootLogin yes`` in the main file.
+    """
     fs = FakeFileSystem(files={
-        DEFAULT_SSHD_CONFIG_PATH: "PermitRootLogin yes\nProtocol 2\n",
+        DEFAULT_SSHD_CONFIG_PATH: (
+            f"Include {DEFAULT_SSHD_DROP_IN_DIR}/*.conf\n"
+            "PermitRootLogin yes\n"
+            "Protocol 2\n"
+        ),
         f"{DEFAULT_SSHD_DROP_IN_DIR}/90-hardening.conf": "PermitRootLogin no\n",
     })
     findings = analyze_ssh_config(fs)
+    # Stream order: drop-in (PermitRootLogin no) → main (yes).
+    # First-obtained-wins → drop-in's ``no`` wins → no CRITICAL.
     assert _by_title(findings, "root SSH login allowed") == [], (
-        "PermitRootLogin yes CRITICAL should be suppressed by the "
-        "drop-in override"
+        "When the drop-in comes BEFORE the main file's directive "
+        "(because Include is at the top of the main file), the "
+        "drop-in's value is the first obtained value and wins"
+    )
+
+
+def test_drop_in_does_not_override_after_include_position():
+    """The complementary case: when ``Include`` is placed AFTER the
+    main file's directive (a non-default but legal layout), the
+    main file's directive is the first obtained value and wins.
+
+    This regression locks the position-sensitive first-obtained-wins
+    rule that the previous last-wins snapshot got wrong.
+    """
+    fs = FakeFileSystem(files={
+        DEFAULT_SSHD_CONFIG_PATH: (
+            "PermitRootLogin yes\n"
+            "Protocol 2\n"
+            f"Include {DEFAULT_SSHD_DROP_IN_DIR}/*.conf\n"
+        ),
+        f"{DEFAULT_SSHD_DROP_IN_DIR}/90-hardening.conf": "PermitRootLogin no\n",
+    })
+    findings = analyze_ssh_config(fs)
+    # Stream order: main (yes) → drop-in (no).
+    # First-obtained-wins → main's ``yes`` wins → CRITICAL fires.
+    crit = _by_title(findings, "root SSH login allowed")
+    assert len(crit) == 1, (
+        "When the main file's directive appears BEFORE the Include, "
+        "the main file's value is the first obtained value and wins"
+    )
+    assert crit[0].details["source_path"] == DEFAULT_SSHD_CONFIG_PATH
+
+
+def test_drop_in_overrides_when_main_is_silent():
+    """When the main file is silent on PermitRootLogin and a
+    drop-in sets it to ``yes``, the CRITICAL fires (the drop-in is
+    the first obtained value via the explicit Include)."""
+    fs = FakeFileSystem(files={
+        DEFAULT_SSHD_CONFIG_PATH: (
+            f"Include {DEFAULT_SSHD_DROP_IN_DIR}/*.conf\n"
+            "Protocol 2\n"
+        ),
+        f"{DEFAULT_SSHD_DROP_IN_DIR}/10-weak.conf": "PermitRootLogin yes\n",
+    })
+    findings = analyze_ssh_config(fs)
+    crit = _by_title(findings, "root SSH login allowed")
+    assert len(crit) == 1
+    assert crit[0].details["source_path"] == (
+        f"{DEFAULT_SSHD_DROP_IN_DIR}/10-weak.conf"
     )
 
 
@@ -270,16 +335,23 @@ def test_drop_ins_are_concatenated_alphabetically():
     """Drop-ins must be parsed in alphabetical order to match
     OpenSSH ``Include /etc/ssh/sshd_config.d/*.conf`` semantics."""
     fs = FakeFileSystem(files={
-        DEFAULT_SSHD_CONFIG_PATH: "Protocol 2\n",
+        DEFAULT_SSHD_CONFIG_PATH: (
+            f"Include {DEFAULT_SSHD_DROP_IN_DIR}/*.conf\n"
+            "Protocol 2\n"
+        ),
         # Intentionally out of alphabetical order on disk; the
         # analyzer must sort before reading.
         f"{DEFAULT_SSHD_DROP_IN_DIR}/zz-late.conf": "PermitRootLogin no\n",
         f"{DEFAULT_SSHD_DROP_IN_DIR}/aa-early.conf": "PermitRootLogin yes\n",
     })
     findings = analyze_ssh_config(fs)
-    # Last-wins: ``zz-late.conf`` overrides ``aa-early.conf`` —
-    # PermitRootLogin no survives → no CRITICAL.
-    assert _by_title(findings, "root SSH login allowed") == []
+    # Stream order: Include → aa-early (yes) → zz-late (no) → main.
+    # First-wins → aa-early's ``yes`` is the first obtained value.
+    crit = _by_title(findings, "root SSH login allowed")
+    assert len(crit) == 1
+    assert crit[0].details["source_path"] == (
+        f"{DEFAULT_SSHD_DROP_IN_DIR}/aa-early.conf"
+    )
 
 
 def test_non_conf_files_in_drop_in_dir_are_ignored():
