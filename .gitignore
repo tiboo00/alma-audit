@@ -38,3 +38,9 @@ Thumbs.db
 # alma-audit specific
 alma-audit-out/
 multica-delegation-*.md
+
+# uv is not part of this project's tooling — `pyproject.toml` uses
+# setuptools, the README/deploy docs reference `pip` only. The lockfile
+# is a local artifact left behind by someone running `uv` in their
+# dev environment; do not ship it.
+uv.lock

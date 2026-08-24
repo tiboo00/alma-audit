@@ -76,9 +76,22 @@ def _emit_unreadable_warn(
             ],
         },
         recommendation=(
-            "Grant the audit user read access on the affected CSF "
-            "state files (typically membership in the `wheel` group "
-            "or `chmod a+r /etc/csf/csf.*`)."
+            "Grant the audit service account targeted read access "
+            "on the affected `csf.deny` / `csf.allow` files. The "
+            "recommended pattern is a dedicated `alma-audit` group "
+            "that owns nothing else, then POSIX ACLs scoped to that "
+            "group only:\n"
+            "\n"
+            "    groupadd alma-audit\n"
+            "    usermod -aG alma-audit alma-audit-user\n"
+            "    setfacl -m g:alma-audit:r /etc/csf/csf.deny\n"
+            "    setfacl -m g:alma-audit:r /etc/csf/csf.allow\n"
+            "\n"
+            "Avoid membership in `wheel` (full sudo) and avoid "
+            "blanket `chmod a+r` — csf.deny encodes the host's "
+            "active firewall blocklist, which an unprivileged "
+            "local user could read to map the operator's "
+            "response patterns."
         ),
     ))
 

@@ -130,9 +130,21 @@ def analyze_cphulk_logs(
                 "unreadable": [{"path": p, "error": e} for p, e in unreadable],
             },
             recommendation=(
-                "Grant the audit user read access on the affected "
-                "cphulkd log paths (typically membership in the "
-                "`cpanel` or `wheel` group)."
+                "Grant the audit service account targeted read access "
+                "on the affected cphulkd log. The recommended pattern "
+                "is a dedicated `alma-audit` group that owns nothing "
+                "else, then POSIX ACLs scoped to that group only:\n"
+                "\n"
+                "    groupadd alma-audit\n"
+                "    usermod -aG alma-audit alma-audit-user\n"
+                "    setfacl -m g:alma-audit:r /var/log/cphulkd.log\n"
+                "    setfacl -d -m g:alma-audit:r /var/log\n"
+                "\n"
+                "Avoid membership in `cpanel` or `wheel` — those "
+                "groups grant write access to the log file (and "
+                "in `wheel`'s case, full sudo). cphulkd.log carries "
+                "credential-stuffing source IPs that should not be "
+                "readable by every member of those groups."
             ),
         ))
 

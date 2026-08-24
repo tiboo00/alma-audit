@@ -160,9 +160,22 @@ def analyze_secure_logs(
                 "unreadable": [{"path": p, "error": e} for p, e in unreadable],
             },
             recommendation=(
-                "Grant the audit user read access on the affected "
-                "log paths (typically group membership in `adm` or "
-                "explicit `chmod a+r`)."
+                "Grant the audit service account targeted read access "
+                "on the affected log paths. The recommended pattern "
+                "is a dedicated `alma-audit` group that owns nothing "
+                "else, then POSIX ACLs scoped to that group only:\n"
+                "\n"
+                "    groupadd alma-audit\n"
+                "    usermod -aG alma-audit alma-audit-user\n"
+                "    setfacl -m g:alma-audit:r /var/log/secure\n"
+                "    setfacl -m g:alma-audit:r /var/log/auth.log\n"
+                "    setfacl -d -m g:alma-audit:r /var/log\n"
+                "\n"
+                "Avoid blanket `chmod a+r` and broad system groups "
+                "(`adm`, `wheel`) — `/var/log/secure*` and "
+                "`/var/log/auth.log*` carry credential and session "
+                "data that should not be readable by every local "
+                "user account."
             ),
         ))
 
