@@ -16,6 +16,14 @@ AISO-197: per-(ip, user) forensic detail for SSH failures and sudo
 failures, with first_seen/last_seen timestamps. No cap on list size
 per the operator's "show me everything" rule — the per-file line cap
 in settings.py is the only budget control.
+
+AISO-201: the host's own IPs (auto-detected + operator allowlist) are
+filtered out of the SSH brute-force counters and the forensic detail
+SKIPPED paths. A cPanel server is going to log hundreds of self-login
+attempts from cron jobs, monitoring, internal services — treating
+those as brute-force would drown the operator in noise. The forensic
+JSON still records every self-IP event so the operator can audit it,
+but the per-IP counters and the SSH brute-force finding skip them.
 """
 
 from __future__ import annotations
@@ -23,6 +31,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any, Iterable
 
+from ...self_ip import is_self_ip
 from .parser import SecureRecord
 
 
@@ -47,7 +56,15 @@ class _PerIPUserStat:
 class SecureAggregator:
     """Streaming aggregator. Call `add(record)` per parsed line, then `finalize()`."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        self_ips: set[str] | None = None,
+    ) -> None:
+        # AISO-201: the host's own IPs (auto-detected + operator allowlist).
+        # SSH / sudo events from these IPs are still recorded in the
+        # forensic JSON, but the brute-force counters skip them so a
+        # cPanel self-login cron doesn't trip a CRITICAL finding.
+        self.self_ips: set[str] = self_ips or set()
         # SSH brute-force tracking.
         self.ssh_fail_by_ip: Counter[str] = Counter()
         self.ssh_invalid_users: list[str] = []
@@ -64,6 +81,10 @@ class SecureAggregator:
         self.total_lines: int = 0
         self.classified_lines: int = 0
         self.malformed_lines: int = 0
+        # AISO-201: track self-IP events for the forensic dump even
+        # when we skip them in the brute-force counters.
+        self.self_ip_event_count: int = 0
+        self.self_ip_examples: list[str] = []
         # AISO-197 forensic detail: ssh_fail_by_ip_user and
         # sudo_fail_by_user_full track (ip, user) pairs with timestamps.
         # Stored as dict-of-dicts for O(1) updates.
@@ -86,22 +107,42 @@ class SecureAggregator:
         self.classified_lines += 1
         ts = getattr(record, "raw_timestamp", "") or ""
         if record.event == "ssh_fail" and record.source_ip:
-            self.ssh_fail_by_ip[record.source_ip] += 1
-            if record.user:
-                self.ssh_invalid_users.append(record.user)
-            self._bump_ssh(record.source_ip, record.user, ts)
+            # AISO-201: skip self-IP in brute-force counter. Forensic
+            # JSON still records the event so the operator can audit
+            # their own cron / monitoring noise.
+            if is_self_ip(record.source_ip, self.self_ips):
+                self.self_ip_event_count += 1
+                if len(self.self_ip_examples) < 5:
+                    self.self_ip_examples.append(
+                        f"ssh_fail from {record.source_ip} (self-IP)"
+                    )
+            else:
+                self.ssh_fail_by_ip[record.source_ip] += 1
+                if record.user:
+                    self.ssh_invalid_users.append(record.user)
+                self._bump_ssh(record.source_ip, record.user, ts)
         elif record.event == "ssh_invalid_user" and record.source_ip:
             # Treat `Invalid user X from Y` the same as a fail for the
             # burst counter — the scanner has already tried to log in
             # with a non-existent account. Without this distinction an
             # attacker that rotates usernames wouldn't trip the rule.
-            self.ssh_fail_by_ip[record.source_ip] += 1
-            if record.user:
-                self.ssh_invalid_users.append(record.user)
-            self._bump_ssh(record.source_ip, record.user, ts)
+            if is_self_ip(record.source_ip, self.self_ips):
+                self.self_ip_event_count += 1
+                if len(self.self_ip_examples) < 5:
+                    self.self_ip_examples.append(
+                        f"ssh_invalid_user from {record.source_ip} (self-IP)"
+                    )
+            else:
+                self.ssh_fail_by_ip[record.source_ip] += 1
+                if record.user:
+                    self.ssh_invalid_users.append(record.user)
+                self._bump_ssh(record.source_ip, record.user, ts)
         elif record.event == "ssh_accept" and record.source_ip:
             self.ssh_accept_by_ip[record.source_ip] += 1
         elif record.event == "sudo_fail" and record.user:
+            # Sudo fails aren't per-IP in our parser, but we still
+            # protect against the local-sudo noise (e.g. a cron job
+            # running `sudo -n <command>` from a service account).
             self.sudo_fail_by_user[record.user] += 1
             stat = self.sudo_fail_by_user_full.get(record.user)
             if stat is None:
@@ -176,4 +217,9 @@ class SecureAggregator:
             # AISO-197 forensic detail.
             "ssh_fail_details": ssh_details,
             "sudo_fail_details": sudo_details,
+            # AISO-201: self-IP events (cron / monitoring noise from
+            # the host itself). Recorded for diagnostic purposes; not
+            # surfaced as a finding.
+            "self_ip_event_count": self.self_ip_event_count,
+            "self_ip_examples": list(self.self_ip_examples),
         }

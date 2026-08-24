@@ -20,6 +20,7 @@ from .analyzers.ssl_cert import analyze_ssl_certs
 from .config import Config
 from .models import Finding, Severity
 from .runners import FileSystem
+from .self_ip import detect_self_ips  # noqa: F401  (used in run_analyzers)
 
 _LOG = logging.getLogger("alma_audit")
 
@@ -202,6 +203,13 @@ def run_analyzers(cfg: Config, fs: FileSystem) -> list[Finding]:
         rules=cfg.modules.get("modsec_log", {}),
     ))
 
+    # AISO-201: detect the host's own IPs so self-logins (cron /
+    # monitoring / internal services) don't trip brute-force findings.
+    # The operator can extend the set via `modules.secure_log.trusted_ips`.
+    operator_trusted = list(cfg.modules.get("secure_log", {}).get("trusted_ips", []) or [])
+    self_ips = detect_self_ips(operator_trusted)
+    _LOG.debug("self-IP set for self-login filter: %s", sorted(self_ips))
+
     # Quick-win analyzers (GAPS §4). Each is bounded: the analyzer
     # emits its own INFO finding when no files match. We do NOT
     # gate on root readability at the runner layer — the analyzer
@@ -212,6 +220,7 @@ def run_analyzers(cfg: Config, fs: FileSystem) -> list[Finding]:
         secure_paths,
         fs,
         rules=cfg.modules.get("secure_log", {}),
+        self_ips=self_ips,
     ))
 
     cphulk_paths = _effective_cphulk_paths(cfg, fs)

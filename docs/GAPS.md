@@ -309,8 +309,10 @@ but always "what new file does this belong in".
 | `analyzers/modsec_log.py` | 351 | 🟢 ok | could split: `modsec_parser.py` + `modsec_analyze.py` |
 | `analyzers/crawler_verify.py` | 317 | 🟢 ok | tightly scoped (one verification chain); keep as-is |
 | `analyzers/secure_log/parser.py` | 293 | 🟢 ok | AISO-186/197 — syslog + sudo + useradd regexes; carries raw_timestamp |
-| `analyzers/secure_log/aggregator.py` | 178 | 🟢 ok | AISO-197 — per-(ip,user) SSH/sudo forensic detail with timestamps |
+| `analyzers/secure_log/aggregator.py` | 224 | 🟢 ok | AISO-197/201 — per-(ip,user) SSH/sudo forensic + self-IP filter |
 | `analyzers/secure_log/rules.py` | 197 | 🟢 ok | D8/D9/D10/D11 rules |
+| `analyzers/secure_log/analyzer.py` | 201 | 🟢 ok | orchestrator; accepts self_ips kwarg (AISO-201) |
+| `self_ip.py` | 125 | 🟢 ok | AISO-201 — host self-IP detector (DNS-based, no subprocess per read-only contract) |
 | `analyzers/secure_log/settings.py` | 51 | 🟢 ok | thresholds + globs |
 | `analyzers/secure_log/analyzer.py` | 199 | 🟢 ok | orchestrator |
 | `analyzers/secure_log/__init__.py` | 45 | 🟢 ok | re-exports |

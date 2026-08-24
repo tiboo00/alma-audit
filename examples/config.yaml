@@ -94,6 +94,12 @@ modules:
     new_root_account_enabled: true
     max_files: 20
     max_lines_per_file: 200000
+    # AISO-201: explicit self-IP allowlist. SSH / sudo events from
+    # these IPs are skipped in the brute-force counters so cPanel
+    # cron / monitoring noise doesn't trip CRITICAL findings. The
+    # auto-detector (socket.gethostbyname) covers most hosts, but
+    # NAT'd or multi-NIC boxes may need an explicit list.
+    trusted_ips: []
 
   cphulk_log:
     brute_force_warn: 5

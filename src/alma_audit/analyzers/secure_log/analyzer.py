@@ -33,18 +33,20 @@ def analyze_secure_logs(
     paths: Iterable[str],
     fs: FileSystem,
     rules: dict[str, Any] | None = None,
+    *,
+    self_ips: set[str] | None = None,
 ) -> list[Finding]:
     """Run the secure/auth.log analyzer across `paths` and emit findings.
 
-    Each `path` is opened via the injected `FileSystem` (read-only
-    contract is enforced upstream). Compressed rotations (`.gz`,
-    `.bz2`, `.xz`, `.zst`) are listed in a `skipped_compressed` block
-    on the summary finding, not silently dropped — operators need the
-    forensic trail when older data is not inspected.
+    `self_ips` is the host's own IP set (AISO-201). SSH fail events from
+    these IPs are skipped in the brute-force counters — a cPanel
+    server's cron / monitoring / internal-service self-logins would
+    otherwise flood the report. The forensic JSON still records the
+    event so the operator can audit it.
     """
     settings = {**DEFAULT_RULES, **(rules or {})}
     cap = settings["max_lines_per_file"] or None
-    agg = SecureAggregator()
+    agg = SecureAggregator(self_ips=self_ips or set())
     files_scanned = 0
     skipped_compressed: list[str] = []
     unreadable: list[tuple[str, str]] = []  # (path, error str)
