@@ -15,6 +15,8 @@ from .analyzers.cphulk_log import analyze_cphulk_logs
 from .analyzers.csf_state import analyze_csf_state
 from .analyzers.domlog_inventory import analyze_domlog_inventory
 from .analyzers.error_log import analyze_error_log
+from .analyzers.firewall_state import analyze_firewall_state
+from .analyzers.listening_ports import analyze_listening_ports
 from .analyzers.modsec_log import analyze_modsec_and_errors
 from .analyzers.secure_log import analyze_secure_logs
 from .analyzers.ssh_hardening import analyze_ssh_config
@@ -303,5 +305,29 @@ def run_analyzers(cfg: Config, fs: FileSystem) -> list[Finding]:
         drop_in_dir=ssh_drop_in_dir,
         rules=ssh_hardening_rules,
     ))
+
+    # AISO-220: listening-port snapshot + firewall-state detection.
+    # Both analyzers pick Layer A (the sidecar JSON at
+    # ``<output>/port-audit.json``) when present, Layer B (``/proc/net/*``
+    # + filesystem probes) otherwise. The Layer A path is resolved by
+    # ``runner.py`` from ``cfg.paths.port_audit_json`` (set in cli.py
+    # from the CLI ``--output`` flag). Operator YAML override wins.
+    port_audit_json = (
+        cfg.modules.get("listening_ports", {}).get("layer_a_json_path")
+        or cfg.modules.get("firewall_state", {}).get("layer_a_json_path")
+        or cfg.paths.port_audit_json
+    )
+
+    if cfg.modules.get("listening_ports", {}).get("enabled", True):
+        listening_rules = dict(cfg.modules.get("listening_ports", {}) or {})
+        # Preserve the resolved Layer A path unless the operator set a
+        # custom one in ``modules.listening_ports.layer_a_json_path``.
+        listening_rules.setdefault("layer_a_json_path", port_audit_json)
+        findings.extend(analyze_listening_ports(fs, rules=listening_rules))
+
+    if cfg.modules.get("firewall_state", {}).get("enabled", True):
+        firewall_rules = dict(cfg.modules.get("firewall_state", {}) or {})
+        firewall_rules.setdefault("layer_a_json_path", port_audit_json)
+        findings.extend(analyze_firewall_state(fs, rules=firewall_rules))
 
     return findings

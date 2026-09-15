@@ -496,6 +496,482 @@ def _build_fix_library() -> dict[str, FindingFix]:
         ),
     )
 
+    # ----------------------------------------------------------------
+    # D21 — critical service public-bind (AISO-220, listening_ports)
+    # Per-service local_config fix — every entry points at the
+    # canonical "bind to loopback / private interface" config file
+    # for that service. WAF / app_config scopes are not relevant:
+    # the WAF cannot help (the port is open on the host), and the
+    # ``app_config`` scope here is the same local_config file.
+    # ----------------------------------------------------------------
+    _add(
+        lib,
+        "D21:mysql_public_bind", SCOPE_LOCAL_CONFIG,
+        what="bind-address = 127.0.0.1 in /etc/my.cnf",
+        why=(
+            "MySQL must never be reachable from the public internet. "
+            "The bind-address directive constrains the daemon to a "
+            "single interface; combined with CSF/firewalld IP-restrict "
+            "for monitoring, this is the canonical lockdown."
+        ),
+        risk="low",
+        commands=[
+            "# /etc/my.cnf or /etc/my.cnf.d/server.cnf (cPanel):",
+            "[mysqld]",
+            "bind-address = 127.0.0.1",
+            "",
+            "# Restart (cPanel):",
+            "/scripts/restartsrv_mysql",
+            "# or: systemctl restart mysql",
+        ],
+        rollback=(
+            "Edit the same file and revert bind-address (or set to "
+            "the previous value). Restart MySQL."
+        ),
+    )
+    _add(
+        lib,
+        "D21:postgres_public_bind", SCOPE_LOCAL_CONFIG,
+        what="listen_addresses = 'localhost' in postgresql.conf",
+        why=(
+            "PostgreSQL defaults to listening on every interface. "
+            "Restrict it to localhost unless remote access is required "
+            "(in which case scope it via pg_hba.conf + firewall IP allow)."
+        ),
+        risk="low",
+        commands=[
+            "# /var/lib/pgsql/data/postgresql.conf (path varies by distro):",
+            "listen_addresses = 'localhost'",
+            "",
+            "# Reload without dropping connections:",
+            "systemctl reload postgresql",
+        ],
+        rollback=(
+            "Restore the previous listen_addresses value and "
+            "systemctl reload postgresql."
+        ),
+    )
+    _add(
+        lib,
+        "D21:redis_public_bind", SCOPE_LOCAL_CONFIG,
+        what="bind 127.0.0.1 + protected-mode yes in redis.conf",
+        why=(
+            "Redis on 0.0.0.0 is one of the most common misconfigurations "
+            "that leads to ransomware-style data wipe attacks (the "
+            "Redlock 'redis-magic' campaign). The bind + protected-mode "
+            "pair is the canonical lockdown."
+        ),
+        risk="low",
+        commands=[
+            "# /etc/redis/redis.conf:",
+            "bind 127.0.0.1",
+            "protected-mode yes",
+            "",
+            "systemctl restart redis",
+        ],
+        rollback=(
+            "Restore the previous bind line and ``systemctl restart redis``."
+        ),
+    )
+    _add(
+        lib,
+        "D21:memcached_public_bind", SCOPE_LOCAL_CONFIG,
+        what="memcached -l 127.0.0.1 in /etc/sysconfig/memcached",
+        why=(
+            "Memcached on 0.0.0.0 was the basis of a major 2018 DDoS "
+            "amplification campaign. Restrict to loopback; remote access "
+            "is unsupported by design."
+        ),
+        risk="low",
+        commands=[
+            "# /etc/sysconfig/memcached:",
+            "OPTIONS=\"-l 127.0.0.1\"",
+            "",
+            "systemctl restart memcached",
+        ],
+        rollback=(
+            "Restore the previous OPTIONS line and restart memcached."
+        ),
+    )
+    _add(
+        lib,
+        "D21:mongodb_public_bind", SCOPE_LOCAL_CONFIG,
+        what="bindIp: 127.0.0.1 in mongod.conf",
+        why=(
+            "MongoDB was hit by a wave of ransomware attacks in 2017 "
+            "after operators left it bound to 0.0.0.0 with no auth. The "
+            "default config now binds to localhost; verify on legacy hosts."
+        ),
+        risk="low",
+        commands=[
+            "# /etc/mongod.conf:",
+            "net:",
+            "  bindIp: 127.0.0.1",
+            "",
+            "systemctl restart mongod",
+        ],
+        rollback=(
+            "Restore the previous bindIp and restart mongod."
+        ),
+    )
+    _add(
+        lib,
+        "D21:telnet_public_bind", SCOPE_LOCAL_CONFIG,
+        what="telnet server disabled + SSH replaces it",
+        why=(
+            "telnet is plaintext. Disable the daemon (``systemctl disable "
+            "--now telnet.socket``) and use SSH for any remote shell access. "
+            "telnet should not be exposed to the network under any "
+            "circumstance in 2026."
+        ),
+        risk="low",
+        commands=[
+            "systemctl disable --now telnet.socket",
+            "systemctl mask telnet.socket",
+        ],
+        rollback=(
+            "Unmask + enable: ``systemctl unmask telnet.socket && "
+            "systemctl enable --now telnet.socket``."
+        ),
+    )
+    _add(
+        lib,
+        "D21:rdp_public_bind", SCOPE_LOCAL_CONFIG,
+        what="RDP not on a Linux host — investigate",
+        why=(
+            "Remote Desktop Protocol (TCP/3389) is a Windows protocol. "
+            "Its presence on a Linux host is almost always a leftover "
+            "from an old rdesktop / XRDP install, or an accidental "
+            "expose via Docker. Remove the binding or close the port "
+            "at the firewall."
+        ),
+        risk="low",
+        commands=[
+            "# Find the listener:",
+            "ss -tlnp 'sport = :3389'",
+            "",
+            "# If it's xrdp:",
+            "systemctl disable --now xrdp",
+            "",
+            "# If it's Docker / a container:",
+            "docker ps --filter 'publish=3389'",
+        ],
+        rollback=(
+            "Re-enable the service if a documented requirement needs it "
+            "(rare on a Linux box)."
+        ),
+    )
+    _add(
+        lib,
+        "D21:pop3_imap_plaintext", SCOPE_LOCAL_CONFIG,
+        what="Disable POP3/IMAP, force POP3S/IMAPS",
+        why=(
+            "Plaintext POP3/IMAP transmits credentials in the clear. "
+            "cPanel/WHM allows disabling the plaintext variants via the "
+            "Mailserver Configuration UI; do that, then ensure the "
+            "encrypted variants are available on 110/143 blocked / "
+            "993/995 open."
+        ),
+        risk="medium",
+        commands=[
+            "# cPanel/WHM:",
+            "# Home -> Server Configuration -> Mailserver Configuration",
+            "# Disable: POP3, IMAP (the plaintext protocols)",
+            "# Enable:  POP3 with TLS, IMAP with TLS",
+        ],
+        rollback=(
+            "Re-enable via the same WHM UI if a documented client "
+            "requires plaintext."
+        ),
+    )
+    _add(
+        lib,
+        "D21:critical_generic", SCOPE_LOCAL_CONFIG,
+        what="Restrict the bind to loopback or a private interface",
+        why=(
+            "Any service that's not designed for public exposure should "
+            "bind to 127.0.0.1, ::1, or a private interface. If remote "
+            "access is required, scope it via CSF/firewalld to the "
+            "operator's IP range."
+        ),
+        risk="low",
+        commands=[
+            "# 1. Find the service config (most 'bind' or 'listen' settings)",
+            "# 2. Set bind/listen to 127.0.0.1 or a private IP",
+            "# 3. Restart the service",
+            "",
+            "# Pair with a firewall IP-allowlist:",
+            "firewall-cmd --permanent --zone=public --add-rich-rule=' "
+            "rule family=ipv4 source address=<admin-ip> port port=<port> "
+            "protocol=tcp accept' && firewall-cmd --reload",
+        ],
+        rollback=(
+            "Restore the previous bind value and restart the service. "
+            "Remove the firewall rich-rule: "
+            "``firewall-cmd --permanent --remove-rich-rule='...'``."
+        ),
+    )
+
+    # D22 — MySQL bind-address secondary signal (config file pointer)
+    _add(
+        lib,
+        "D22:mysql_bind_address", SCOPE_LOCAL_CONFIG,
+        what="bind-address = 127.0.0.1 in /etc/my.cnf (config file)",
+        why=(
+            "The MySQL config file points to the runtime fix — this "
+            "finding complements D21 (the runtime signal). The two "
+            "together tell the operator the listener is bound and the "
+            "config agrees."
+        ),
+        risk="low",
+        commands=[
+            "# /etc/my.cnf or /etc/my.cnf.d/server.cnf:",
+            "[mysqld]",
+            "bind-address = 127.0.0.1",
+            "",
+            "/scripts/restartsrv_mysql",
+        ],
+        rollback=(
+            "Edit the same file and restore the previous bind-address "
+            "value, then restart MySQL."
+        ),
+    )
+
+    # D23 — IPv6 dual-stack on a critical port
+    _add(
+        lib,
+        "D23:ipv6_dual_stack", SCOPE_LOCAL_CONFIG,
+        what="Bind to BOTH IPv4 loopback AND IPv6 loopback",
+        why=(
+            "Setting bind-address=127.0.0.1 closes the IPv4 listener but "
+            "the IPv6 listener on :: keeps serving. Always pair with the "
+            "IPv6-only bind so the same daemon doesn't have a parallel "
+            "public path."
+        ),
+        risk="low",
+        commands=[
+            "# MySQL example — set BOTH v4 and v6:",
+            "# /etc/my.cnf:",
+            "[mysqld]",
+            "bind-address = 127.0.0.1",
+            "",
+            "# For v6-only: listen on ::1 — service-specific;",
+            "# Redis, Postgres, etc. have their own syntax.",
+            "# Verify after restart:",
+            "ss -tlnp | grep -E '(:3306|:6379|:5432|:27017)'",
+        ],
+        rollback=(
+            "Restore the previous bind value and restart the service."
+        ),
+    )
+
+    # ----------------------------------------------------------------
+    # D25 — no firewall at all (AISO-220, firewall_state)
+    # ----------------------------------------------------------------
+    _add(
+        lib,
+        "D25:no_firewall", SCOPE_LOCAL_CONFIG,
+        what="Install + enable CSF (cPanel) or firewalld (AlmaLinux)",
+        why=(
+            "Every public-facing host should run a host firewall. "
+            "Without one, every listening port is reachable from "
+            "anywhere by default."
+        ),
+        risk="low",
+        commands=[
+            "# cPanel hosts:",
+            "cd /usr/src/csf && sh install.sh",
+            "csf -e",
+            "",
+            "# Plain AlmaLinux:",
+            "dnf install -y firewalld",
+            "systemctl enable --now firewalld",
+            "firewall-cmd --permanent --add-service=ssh",
+            "firewall-cmd --reload",
+        ],
+        rollback=(
+            "Removing CSF / disabling firewalld reverts the firewall to "
+            "host-default (which may mean no firewall at all)."
+        ),
+    )
+
+    # ----------------------------------------------------------------
+    # D26 — engine installed but daemon not running (per engine)
+    # ----------------------------------------------------------------
+    _add(
+        lib,
+        "D26:csf_not_running", SCOPE_LOCAL_CONFIG,
+        what="csf -e + systemctl enable lfd",
+        why=(
+            "CSF ships two daemons; csf -e enables both csf (rules "
+            "engine) and lfd (login failure blocker). Without lfd, "
+            "every brute-force attempt is silent."
+        ),
+        risk="low",
+        commands=[
+            "csf -e",
+            "systemctl enable lfd",
+            "csf -r",
+        ],
+        rollback=(
+            "``csf -x`` disables both daemons temporarily (re-enable with "
+            "``csf -e``)."
+        ),
+    )
+    _add(
+        lib,
+        "D26:firewalld_not_running", SCOPE_LOCAL_CONFIG,
+        what="systemctl enable --now firewalld",
+        why=(
+            "firewalld installed but not active = same as no firewall. "
+            "Enable + open the SSH port BEFORE disconnecting, otherwise "
+            "you'll lock yourself out of the box."
+        ),
+        risk="medium",  # medium because of the lockout risk
+        commands=[
+            "firewall-cmd --permanent --add-service=ssh",
+            "firewall-cmd --reload",
+            "systemctl enable --now firewalld",
+        ],
+        rollback=(
+            "``systemctl disable --now firewalld`` to revert (host falls "
+            "back to no firewall)."
+        ),
+    )
+    _add(
+        lib,
+        "D26:iptables_not_running", SCOPE_LOCAL_CONFIG,
+        what="systemctl enable --now iptables + iptables-restore",
+        why=(
+            "iptables has no daemon — it relies on a service unit that "
+            "restores the rules from /etc/sysconfig/iptables at boot."
+        ),
+        risk="low",
+        commands=[
+            "systemctl enable --now iptables",
+            "iptables-restore < /etc/sysconfig/iptables",
+        ],
+        rollback=(
+            "``systemctl disable --now iptables`` and clear the rules."
+        ),
+    )
+    _add(
+        lib,
+        "D26:nftables_not_running", SCOPE_LOCAL_CONFIG,
+        what="systemctl enable --now nftables + nft -f /etc/nftables.conf",
+        why=(
+            "nftables is userspace + kernel — the rules persist in "
+            "/etc/nftables.conf and the nftables.service unit loads them "
+            "at boot. Enable + restore."
+        ),
+        risk="low",
+        commands=[
+            "systemctl enable --now nftables",
+            "nft -f /etc/nftables.conf",
+        ],
+        rollback=(
+            "``systemctl disable --now nftables`` and ``nft flush ruleset``."
+        ),
+    )
+    _add(
+        lib,
+        "D26:generic", SCOPE_LOCAL_CONFIG,
+        what="Enable the firewall daemon via systemd",
+        why=(
+            "An installed firewall whose daemon is not running offers "
+            "zero protection. Enable it and verify it survives a reboot."
+        ),
+        risk="low",
+        commands=[
+            "systemctl enable --now <firewall-service>",
+        ],
+        rollback=(
+            "``systemctl disable --now <firewall-service>``."
+        ),
+    )
+
+    # D27 — CSF installed but lfd daemon dead
+    _add(
+        lib,
+        "D27:csf_lfd_dead", SCOPE_LOCAL_CONFIG,
+        what="csf -e + systemctl status lfd",
+        why=(
+            "lfd is the per-event blocker that cPanel + cPHulk + CSF "
+            "integrations depend on. Without it, CSF is configuration "
+            "without enforcement."
+        ),
+        risk="low",
+        commands=[
+            "csf -e",
+            "systemctl enable lfd",
+            "systemctl status lfd",
+            "csf -r",
+        ],
+        rollback=(
+            "``systemctl disable lfd`` and ``csf -x`` to revert."
+        ),
+    )
+
+    # D28 — running firewall but ruleset empty
+    _add(
+        lib,
+        "D28:iptables_no_rules", SCOPE_LOCAL_CONFIG,
+        what="Restore iptables rules from /etc/sysconfig/iptables",
+        why=(
+            "A running iptables with no rules accepts every packet by "
+            "default policy — same as no firewall. Restore the baseline."
+        ),
+        risk="low",
+        commands=[
+            "iptables-restore < /etc/sysconfig/iptables",
+            "systemctl reload iptables",
+        ],
+        rollback=(
+            "``iptables -F`` flushes the rules (host falls back to no "
+            "firewall — DON'T do this on a remote session)."
+        ),
+    )
+    _add(
+        lib,
+        "D28:nftables_no_rules", SCOPE_LOCAL_CONFIG,
+        what="Restore nftables ruleset from /etc/nftables.conf",
+        why=(
+            "A running nftables with no ruleset accepts every packet. "
+            "Restore from the saved config."
+        ),
+        risk="low",
+        commands=[
+            "nft -f /etc/nftables.conf",
+            "systemctl reload nftables",
+        ],
+        rollback=(
+            "``nft flush ruleset`` removes all rules (host falls back to "
+            "no firewall)."
+        ),
+    )
+    _add(
+        lib,
+        "D28:generic_no_rules", SCOPE_LOCAL_CONFIG,
+        what="Populate the firewall ruleset from your baseline config",
+        why=(
+            "A running firewall with no rules offers zero protection. "
+            "Reload the rules from your distro's canonical config file."
+        ),
+        risk="low",
+        commands=[
+            "# iptables:",
+            "iptables-restore < /etc/sysconfig/iptables",
+            "# OR nftables:",
+            "nft -f /etc/nftables.conf",
+            "# OR CSF:",
+            "csf -r",
+        ],
+        rollback=(
+            "Flush: ``iptables -F`` / ``nft flush ruleset`` / ``csf -f`` "
+            "(host falls back to no firewall)."
+        ),
+    )
+
     return lib
 
 

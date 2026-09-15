@@ -255,6 +255,54 @@ check "AISO-211 (error_rate) — error_rate_external field emitted" \
 check "AISO-211 (error_log) — error_log analyzer package" \
     "test -f src/alma_audit/analyzers/error_log/__init__.py"
 
+# AISO-220: listening_ports + firewall_state analyzers (AISO-220).
+# Closes the GAPS §3.6 "Network / listening services" gap + the
+# "is there ANY firewall at all?" gap. Two-layer design: sidecar
+# ``tools/port_audit.sh`` writes JSON, analyzers consume it (or
+# fall back to /proc + filesystem probes via the read-only contract).
+check "AISO-220 (listening_ports) — analyzer package exists" \
+    "test -f src/alma_audit/analyzers/listening_ports/__init__.py"
+check "AISO-220 (listening_ports) — 5-file split per GAPS §7.3" \
+    "test -f src/alma_audit/analyzers/listening_ports/parser.py && \
+     test -f src/alma_audit/analyzers/listening_ports/aggregator.py && \
+     test -f src/alma_audit/analyzers/listening_ports/rules.py && \
+     test -f src/alma_audit/analyzers/listening_ports/settings.py && \
+     test -f src/alma_audit/analyzers/listening_ports/analyzer.py"
+check "AISO-220 (listening_ports) — D21 critical-port rule exists" \
+    "grep -q 'rule_d21_critical_public_bind\\|D21:mysql_public_bind' src/alma_audit/analyzers/listening_ports/rules.py"
+check "AISO-220 (listening_ports) — /proc/net hex decoder" \
+    "grep -q '_hex_to_ip_v4\\|_hex_to_ip_v6' src/alma_audit/analyzers/listening_ports/parser.py"
+check "AISO-220 (listening_ports) — wired into runner.py" \
+    "grep -q 'listening_ports\\|analyze_listening' src/alma_audit/runner.py"
+check "AISO-220 (firewall_state) — analyzer package exists" \
+    "test -f src/alma_audit/analyzers/firewall_state/__init__.py"
+check "AISO-220 (firewall_state) — 5-file split per GAPS §7.3" \
+    "test -f src/alma_audit/analyzers/firewall_state/parser.py && \
+     test -f src/alma_audit/analyzers/firewall_state/aggregator.py && \
+     test -f src/alma_audit/analyzers/firewall_state/rules.py && \
+     test -f src/alma_audit/analyzers/firewall_state/settings.py && \
+     test -f src/alma_audit/analyzers/firewall_state/analyzer.py"
+check "AISO-220 (firewall_state) — D25 no-firewall rule exists" \
+    "grep -q 'rule_d25_no_firewall' src/alma_audit/analyzers/firewall_state/rules.py"
+check "AISO-220 (firewall_state) — wired into runner.py" \
+    "grep -q 'firewall_state\\|analyze_firewall' src/alma_audit/runner.py"
+check "AISO-220 (sidecar) — tools/port_audit.sh script exists" \
+    "test -x tools/port_audit.sh"
+check "AISO-220 (sidecar) — emits valid JSON schema_version:1" \
+    "grep -q 'schema_version' tools/port_audit.sh && \
+     grep -q 'port-audit.json' tools/port_audit.sh"
+check "AISO-220 (cli) — --list-analyzers includes the new names" \
+    "grep -q 'listening_ports' src/alma_audit/cli.py && \
+     grep -q 'firewall_state' src/alma_audit/cli.py"
+check "AISO-220 (fix_library) — D21/D22/D23/D25/D26/D27/D28 fixes wired" \
+    "grep -qE 'D21:|D22:|D23:|D25:|D26:|D27:|D28:' src/alma_audit/fix_suggestions.py"
+check "AISO-220 (read-only) — no subprocess in analyzers" \
+    "PYTHONPATH=src tests/test_readonly.sh 2>/dev/null; grep -q 'test_no_subprocess' tests/test_readonly.py"
+check "AISO-220 (tests) — test_listening_ports + test_firewall_state + test_port_audit_json exist" \
+    "test -f tests/test_listening_ports.py && \
+     test -f tests/test_firewall_state.py && \
+     test -f tests/test_port_audit_json.py"
+
 # ---------------------------------------------------------------------
 # 2. Test suite green — uses the resolved interpreter.
 # ---------------------------------------------------------------------
@@ -323,6 +371,10 @@ check "CLI lists new analyzer: ssh_hardening" \
     "echo '$ANALYZER_LIST' | grep -q 'ssh_hardening'"
 check "CLI lists new analyzer: error_log" \
     "echo '$ANALYZER_LIST' | grep -q 'error_log'"
+check "CLI lists new analyzer: listening_ports (AISO-220)" \
+    "echo '$ANALYZER_LIST' | grep -q 'listening_ports'"
+check "CLI lists new analyzer: firewall_state (AISO-220)" \
+    "echo '$ANALYZER_LIST' | grep -q 'firewall_state'"
 
 # ---------------------------------------------------------------------
 # 4. Container integration smoke test — REAL synthetic audit, not just

@@ -159,6 +159,13 @@ def _apply_cli_overrides(cfg: Config, args: argparse.Namespace) -> Config:
             )
     if getattr(args, "ssh_drop_in_dir", None):
         cfg.paths.ssh_drop_in_dir = args.ssh_drop_in_dir
+    # AISO-220: resolve the Layer A sidecar JSON path to <output>/port-audit.json
+    # so the listening_ports + firewall_state analyzers pick it up
+    # automatically when the operator runs ``tools/port_audit.sh`` ahead
+    # of the audit. YAML overrides win (operators can set
+    # ``paths.port_audit_json`` in their config file).
+    if cfg.paths.port_audit_json is None:
+        cfg.paths.port_audit_json = os.path.join(args.output, "port-audit.json")
     return cfg
 
 
@@ -182,10 +189,16 @@ def main(argv: list[str] | None = None) -> int:
         # rather than its log output. ``error_log`` (AISO-211) is
         # the Apache error_log analyzer — opt-in via
         # ``modules.error_log.enabled``, listed for introspection.
+        # ``listening_ports`` and ``firewall_state`` (AISO-220) cover
+        # the GAPS §3.6 "Network / listening services" + the
+        # "is there ANY firewall at all?" gaps — the latter was
+        # previously only covered by the optional ``csf_state``
+        # analyzer's "no CSF state files found" INFO finding.
         for name in (
             "access_log", "domlog_inventory", "modsec_log", "crawler_verify",
             "secure_log", "ssl_cert", "cphulk_log", "csf_state",
             "ssh_hardening", "error_log",
+            "listening_ports", "firewall_state",
         ):
             print(name)
         return 0
