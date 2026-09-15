@@ -63,6 +63,13 @@ paths:
   ssh_config_path: /etc/ssh/sshd_config
   ssh_drop_in_dir: /etc/ssh/sshd_config.d
 
+  # AISO-220: Layer A sidecar JSON path. ``cli.py`` resolves this
+  # from ``--output`` automatically when empty. Override only when
+  # the sidecar lives at a non-standard location.
+  # port_audit_json: /var/log/alma-audit/port-audit.json
+  # Layer B /proc fallback root (chroot / container overrides only).
+  proc_root: /proc
+
 modules:
   access_log:
     top_host_share_warn: 0.30
@@ -217,3 +224,44 @@ modules:
     # `LoginGraceTime` (seconds) greater than this is a WARN.
     # 120 matches the OpenSSH default + CIS Benchmark upper bound.
     login_grace_time_warn: 120
+
+  # AISO-220: listening_ports analyzer. Audits every TCP/UDP
+  # listener the host has open. Layer A (sidecar JSON at
+  # ``<output>/port-audit.json``) is preferred when present;
+  # Layer B (``/proc/net/tcp{,6}`` + ``/proc/net/udp{,6}``) is the
+  # read-only fallback when the sidecar wasn't run.
+  listening_ports:
+    # Set to false to disable the analyzer entirely.
+    enabled: true
+    # Operator-supplied override of the Layer A JSON path. Leave
+    # empty to let ``runner.py`` resolve it from ``--output`` +
+    # ``port-audit.json``.
+    # layer_a_json_path: /var/log/alma-audit/port-audit.json
+    # Custom critical-port list — extend the default PORT_SERVICE_MAP.
+    # The default already includes 3306 (mysql), 5432 (postgres),
+    # 6379 (redis), 11211 (memcached), 27017 (mongodb), 1433 (mssql),
+    # 9200 (elasticsearch), 9300 (elasticsearch-transport), 5984
+    # (couchdb), 110 (pop3), 143 (imap), 23 (telnet), 3389 (rdp).
+    # critical_ports: [3306, 5432, 6379, 11211, 27017]
+    # Set false to skip Layer B fallback entirely (e.g. chroot
+    # where /proc isn't the live socket table).
+    fallback_to_proc: true
+    # Set false to suppress D24 (unknown high port public bind) INFO
+    # findings. Operators with a deliberate custom-port landscape
+    # typically want this off to reduce noise.
+    warn_unknown_high_port: true
+
+  # AISO-220: firewall_state analyzer. Detects which firewall
+  # engines are installed + running. Layer A (sidecar JSON)
+  # preferred; Layer B (filesystem probes) is the fallback when
+  # the sidecar wasn't run.
+  firewall_state:
+    enabled: true
+    # layer_a_json_path: /var/log/alma-audit/port-audit.json
+    fallback_to_fs: true
+    # D28 thresholds — running firewall with rule counts below
+    # these is considered "effectively empty" → WARN.
+    iptables_filter_min_lines: 5
+    nftables_min_lines: 5
+    # Set false to suppress D27 (CSF installed but lfd daemon dead).
+    csf_check_lfd: true

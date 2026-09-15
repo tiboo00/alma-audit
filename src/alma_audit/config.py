@@ -86,6 +86,14 @@ class Paths:
     # analyzer applies the standard last-wins rule.
     ssh_config_path: str = "/etc/ssh/sshd_config"
     ssh_drop_in_dir: str = "/etc/ssh/sshd_config.d"
+    # AISO-220: path to the sidecar JSON ``tools/port_audit.sh`` writes
+    # before the audit. Default ``None`` — ``cli.py`` resolves this to
+    # ``<output>/port-audit.json`` once the CLI flag is parsed.
+    port_audit_json: str | None = None
+    # AISO-220: filesystem root for Layer B ``/proc/net/*`` reads.
+    # Override only for chroot / container / test environments where
+    # ``/proc`` is not the live socket table.
+    proc_root: str = "/proc"
 
     def access_log_paths(self) -> list[str]:
         return _expand(self.apache_root, self.access_log_glob)

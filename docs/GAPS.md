@@ -30,6 +30,8 @@ in the current design, and what would be needed to close it.
 | cPanel | cPHulk brute-force log | ✅ partial | per-IP + per-user burst, block/unblock summary (AISO-186) |
 | cPanel | SSL/TLS cert expiry | ✅ partial | PEM X.509 expiry windows, optional `[ssl]` extra (AISO-186) |
 | cPanel | CSF / csf.deny state | ✅ partial | denylist size + growth vs baseline (AISO-186) |
+| cPanel | Firewall state | ✅ partial | no firewall / not-running / empty ruleset — AISO-220 |
+| cPanel | Listening ports | ✅ partial | service-exposure analysis (MySQL/Postgres/Redis/etc.) — AISO-220 |
 | WHMCS | `configuration.php` perms / license | ❌ no | out of scope |
 | WHMCS | Fraud / order log / gateway webhook abuse | ❌ no | out of scope |
 | WHMCS | Admin audit log / module audit | ❌ no | out of scope |
@@ -150,16 +152,52 @@ filename-level anomalies in domlog.
 
 ### 3.6 Network / listening services
 
-| Gap | Where it lives | Tool / approach | Fits in alma-audit? |
+|| Gap | Where it lives | Tool / approach | Fits in alma-audit? |
 |---|---|---|---|
-| Open ports / services | kernel netlink | `ss -tulnp`, `netstat` | ❌ requires command — breaks read-only |
-| Unexpected bind | same | parser | ❌ |
-| Reverse shell indicator | `ss` + `/proc/*/fd` | custom parser | ❌ requires live system |
-| Outbound C2 | netflow / conntrack | separate pipeline | ❌ |
+|| Open ports / services | kernel netlink + `/proc/net/*` | `ss -tulnp`, `netstat` | ✅ **implemented** (AISO-220) |
+|| Unexpected bind | same | parser | ✅ **implemented** (AISO-220) |
+|| Reverse shell indicator | `ss` + `/proc/*/fd` | custom parser | ❌ requires live system |
+|| Outbound C2 | netflow / conntrack | separate pipeline | ❌ |
 
-**Recommended path:** `ss -tulnp` snapshot at audit time, wrapped in a
-sandboxed helper. Not a fit for the current package; better as a sidecar
-script that writes its own report.
+**Recommended path:** **two layers.** Layer A: ``tools/port_audit.sh``
+writes a single JSON to ``<output>/port-audit.json`` with the full
+listener snapshot (proto, address, port, process, PID) plus the
+firewall engine presence matrix. The ``listening_ports`` analyzer
+reads this when present. Layer B: pure read-only fallback — the
+analyzer reads ``/proc/net/tcp{,6}`` + ``/proc/net/udp{,6}`` through
+the injected ``FileSystem``. No subprocess, no shelling out — the
+alma-audit read-only contract is intact.
+
+The two layers cooperate: Layer A wins when present (richer data +
+process attribution); Layer B is the always-works fallback so the
+audit stays functional when the sidecar couldn't run.
+
+Detection rules:
+
+  * **D21** CRITICAL — critical service (MySQL / Postgres / Redis /
+    Memcached / MongoDB / POP3 / IMAP / telnet / RDP) bound to a
+    public interface.
+  * **D22** INFO    — secondary signal: ``mysql_bind_address`` in
+    ``/etc/my.cnf`` is ``0.0.0.0`` / ``::``. Suppressed when D21
+    already fired CRITICAL (same root cause).
+  * **D23** WARN    — IPv6 dual-stack listener on a critical port
+    (closing IPv4 only is insufficient).
+  * **D24** INFO    — unknown high port public bind (catch-all).
+
+The new ``firewall_state`` analyzer answers the "is there ANY
+firewall at all?" question that the previous code couldn't touch:
+
+  * **D25** CRITICAL — no firewall engine installed.
+  * **D26** CRITICAL — engine installed but the daemon is not running.
+  * **D27** CRITICAL — CSF installed but ``lfd`` daemon dead (cPanel
+    reality check).
+  * **D28** WARN     — running firewall but the ruleset is
+    effectively empty.
+
+Both analyzers ship in the §7.3 five-file split. Every CRITICAL /
+WARN finding carries a structured ``FindingFix`` (AISO-210) pointing
+the operator at the canonical fix path (``bind-address = 127.0.0.1``,
+``csf -e``, ``firewall-cmd --add-service=ssh``, ...).
 
 ### 3.7 Compliance frameworks
 
